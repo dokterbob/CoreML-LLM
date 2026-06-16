@@ -58,8 +58,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="pplx-embed ANE-encoder parity test")
     ap.add_argument("--hf-repo", default="perplexity-ai/pplx-embed-v1-0.6b")
     ap.add_argument("--max-seq-len", type=int, default=64)
-    ap.add_argument("--rescale-k", type=float, default=16.0,
-                    help="fp16 residual rescale factor (0 disables)")
+    ap.add_argument("--rescale-k", type=float, default=8.0,
+                    help="fp16 residual rescale factor (0 disables; K=8 is the default sweet spot)")
     ap.add_argument("--pooled-gate", type=float, default=0.999)
     ap.add_argument("--int8-gate", type=float, default=0.997)
     args = ap.parse_args()

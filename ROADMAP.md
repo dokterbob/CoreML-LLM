@@ -34,8 +34,13 @@ Status of the `pplx-embed` fork work. See [`PPLX_EMBED.md`](PPLX_EMBED.md) for t
   601 ms cpuAndGPU; `.all` picks ANE). EnumeratedShapes verdict: the encoder bakes L into
   RoPE/reshapes so flexible shapes need a rewrite — decision already backed by two siblings +
   this bucket data; a flexible-shape spike is optional.
-- [ ] **A3 — Context variant (late chunking).** `pool_matrix [32,L]` in → `chunk_embeddings
-  [32,1024]` int8 out; per-chunk cosine ≥ 0.997 (exclude zero rows); ANE residency recorded.
+- [x] **A3 — Context variant (late chunking).** `PplxEmbedContextModel`: 3rd input
+  `pool_matrix [32,L]` → per-chunk pooling as one matmul → `chunk_embeddings [32,1024]` int8.
+  CoreML (L=512, K=8): realistic (sentence) chunks **mean 0.99923 / min 0.99785 (PASS)**;
+  **99.80% ANE** (matmul stays on ANE). Native int8 output `[32,1024]` converts.
+  Note: degenerate 1–3 token chunks are fp16-encoder-limited (~0.996); this drove the K
+  retune — **K=8 is now the default** (was 16): better on short chunks (context 0.9911→0.9987)
+  and on plain (0.99967→0.99973), overflow-validated (peak ~37k @455 tok). K=4 overflows.
 - [x] **A4/A5 — Weight quant: investigated, rejected.** int8 `linear_quantize_weights` is
   intrinsically broken on this encoder (cos ~0.42, min 0.006 — independent of the K-rescale and of
   granularity; per_block even fails ANE compile). int4 `palettize_weights` is the only survivor at

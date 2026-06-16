@@ -42,6 +42,9 @@ from ane_ops import (  # noqa: E402
     stable_attention,
 )
 
+# Max chunks per document for the context (late-chunking) variant.
+N_MAX_CHUNKS = 32
+
 
 class Qwen3EncoderConfig:
     """Qwen3 encoder config (read from the pplx-embed HF config.json)."""
@@ -261,6 +264,40 @@ class PplxEmbedModel(nn.Module):
         return q.to(torch.int8)
 
 
+class PplxEmbedContextModel(nn.Module):
+    """Context (late-chunking) forward: encode the whole window once, pool per chunk.
+
+    Inputs:
+        input_ids      (1, L) int32
+        attention_mask (1, L) fp16  — 1.0 valid, 0.0 pad
+        pool_matrix    (N_max, L) fp16 — row k = normalized mean weights over chunk k's
+                       token span (1/n_k on the span, else 0); unused rows are all-zero.
+    Output:
+        chunk_embeddings (N_max, 1024) — int8 or fp16. Unused rows → 0 vector (skip them).
+
+    Pooling is a single matmul `pool_matrix @ hidden`, so the same encoder serves plain
+    (one row = 1/n over all valid tokens) and context. See the pool_matrix lesson.
+    """
+
+    def __init__(self, config: Qwen3EncoderConfig, output_mode: str = "pooled_fp16",
+                 n_max: int = N_MAX_CHUNKS):
+        super().__init__()
+        assert output_mode in ("pooled_fp16", "int8")
+        self.encoder = Qwen3Encoder(config)
+        self.output_mode = output_mode
+        self.n_max = n_max
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor,
+                pool_matrix: torch.Tensor) -> torch.Tensor:
+        hidden = self.encoder(input_ids, attention_mask)           # (1, L, H)
+        h = hidden.squeeze(0).to(torch.float32)                    # (L, H)
+        pooled = pool_matrix.to(torch.float32) @ h                 # (N_max, H)
+        if self.output_mode == "pooled_fp16":
+            return pooled.to(MODEL_DTYPE)
+        q = torch.clamp(torch.round(torch.tanh(pooled) * 127.0), -128, 127)
+        return q.to(torch.int8)
+
+
 # --------------------------------------------------------------------------- #
 # Weight loading.
 # --------------------------------------------------------------------------- #
@@ -347,5 +384,6 @@ def apply_fp16_residual_rescale(encoder: Qwen3Encoder, K: float) -> None:
 
 __all__ = [
     "Qwen3EncoderConfig", "Qwen3EncoderLayer", "Qwen3Encoder",
-    "PplxEmbedModel", "load_encoder_weights", "apply_fp16_residual_rescale",
+    "PplxEmbedModel", "PplxEmbedContextModel", "N_MAX_CHUNKS",
+    "load_encoder_weights", "apply_fp16_residual_rescale",
 ]
