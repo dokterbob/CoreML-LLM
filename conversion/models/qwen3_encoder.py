@@ -46,6 +46,15 @@ from ane_ops import (  # noqa: E402
 N_MAX_CHUNKS = 32
 
 
+def _repeat_kv_b(x: torch.Tensor, n_rep: int, B: int, num_kv_heads: int,
+                 seq_len: int, head_dim: int) -> torch.Tensor:
+    """Batched GQA expansion: (B, kv, S, D) → (B, kv*n_rep, S, D), explicit shapes."""
+    if n_rep == 1:
+        return x
+    x = x.unsqueeze(2).expand(B, num_kv_heads, n_rep, seq_len, head_dim)
+    return x.reshape(B, num_kv_heads * n_rep, seq_len, head_dim)
+
+
 class Qwen3EncoderConfig:
     """Qwen3 encoder config (read from the pplx-embed HF config.json)."""
 
@@ -125,6 +134,7 @@ class Qwen3EncoderLayer(nn.Module):
         num_heads = self.num_heads
         num_kv_heads = self.num_kv_heads
         head_dim = self.head_dim
+        B = hidden_states.shape[0]
 
         residual = hidden_states
         # Normalize in fp32 then downcast: the pre-norm residual can exceed fp16
@@ -132,28 +142,28 @@ class Qwen3EncoderLayer(nn.Module):
         # RMSNorm is scale-invariant; its output is O(1) and fp16-safe.
         normed = self.input_layernorm(hidden_states).to(MODEL_DTYPE)
 
-        # (1, H, 1, L) layout for Conv2d.
+        # (B, H, 1, L) layout for Conv2d.
         x = normed.permute(0, 2, 1).unsqueeze(2)
 
-        # Q/K/V: (1, q_dim, 1, L) → (1, heads, L, head_dim).
-        q = self.self_attn["q_proj"](x).view(1, num_heads, head_dim, seq_len).permute(0, 1, 3, 2)
-        k = self.self_attn["k_proj"](x).view(1, num_kv_heads, head_dim, seq_len).permute(0, 1, 3, 2)
-        v = self.self_attn["v_proj"](x).view(1, num_kv_heads, head_dim, seq_len).permute(0, 1, 3, 2)
+        # Q/K/V: (B, q_dim, 1, L) → (B, heads, L, head_dim).
+        q = self.self_attn["q_proj"](x).view(B, num_heads, head_dim, seq_len).permute(0, 1, 3, 2)
+        k = self.self_attn["k_proj"](x).view(B, num_kv_heads, head_dim, seq_len).permute(0, 1, 3, 2)
+        v = self.self_attn["v_proj"](x).view(B, num_kv_heads, head_dim, seq_len).permute(0, 1, 3, 2)
 
         # QK-norm per head, then RoPE.
-        q = self.self_attn["q_norm"](q.reshape(1, num_heads, seq_len, head_dim))
-        k = self.self_attn["k_norm"](k.reshape(1, num_kv_heads, seq_len, head_dim))
+        q = self.self_attn["q_norm"](q.reshape(B, num_heads, seq_len, head_dim))
+        k = self.self_attn["k_norm"](k.reshape(B, num_kv_heads, seq_len, head_dim))
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # GQA expansion (ANE-safe).
-        k = repeat_kv_ane(k, self.n_rep, num_kv_heads, seq_len, head_dim)
-        v = repeat_kv_ane(v, self.n_rep, num_kv_heads, seq_len, head_dim)
+        # GQA expansion (ANE-safe, batched).
+        k = _repeat_kv_b(k, self.n_rep, B, num_kv_heads, seq_len, head_dim)
+        v = _repeat_kv_b(v, self.n_rep, B, num_kv_heads, seq_len, head_dim)
 
         # Bidirectional attention (fp32), pad-mask only. scale = 1/sqrt(head_dim).
         attn_out = stable_attention(q, k, v, self.scale, attention_mask)
 
-        # (1, heads, L, head_dim) → (1, L, q_dim) → Conv2d o_proj.
-        attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(1, seq_len, num_heads * head_dim)
+        # (B, heads, L, head_dim) → (B, L, q_dim) → Conv2d o_proj.
+        attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(B, seq_len, num_heads * head_dim)
         attn_out = self.self_attn["o_proj"](
             attn_out.permute(0, 2, 1).unsqueeze(2)
         ).squeeze(2).permute(0, 2, 1)
@@ -206,9 +216,10 @@ class Qwen3Encoder(nn.Module):
         self.register_buffer("sin_cached", emb.sin().to(MODEL_DTYPE))
 
     def _pad_mask(self, attention_mask: torch.Tensor, S: int) -> torch.Tensor:
-        """(1, S) {1 valid, 0 pad} → (1, 1, S, S) additive fp16 (0 / −1e4), key-side."""
+        """(B, S) {1 valid, 0 pad} → (B, 1, S, S) additive fp16 (0 / −1e4), key-side."""
+        B = attention_mask.shape[0]
         key_pad = (1.0 - attention_mask).to(MODEL_DTYPE) * self.NEG_INF
-        return key_pad.view(1, 1, 1, S).expand(1, 1, S, S)
+        return key_pad.view(B, 1, 1, S).expand(B, 1, S, S)
 
     def forward(
         self,
