@@ -36,15 +36,19 @@ Status of the `pplx-embed` fork work. See [`PPLX_EMBED.md`](PPLX_EMBED.md) for t
   this bucket data; a flexible-shape spike is optional.
 - [ ] **A3 — Context variant (late chunking).** `pool_matrix [32,L]` in → `chunk_embeddings
   [32,1024]` int8 out; per-chunk cosine ≥ 0.997 (exclude zero rows); ANE residency recorded.
-- [ ] **A4 — Weight-only INT8 quant.** `linear_quantize_weights` via the quant abstraction
-  (INT4 wired but off). Cosine vs fp32 ≥ 0.990.
-- [ ] **A5 — INT8 on ANE.** ANE fraction + latency vs fp16 baseline.
+- [x] **A4/A5 — Weight quant: investigated, rejected.** int8 `linear_quantize_weights` is
+  intrinsically broken on this encoder (cos ~0.42, min 0.006 — independent of the K-rescale and of
+  granularity; per_block even fails ANE compile). int4 `palettize_weights` is the only survivor at
+  **0.905** — still below the 0.990 gate. And it does not matter: weight quant buys only **4–8%**
+  latency (512: 102→94 ms; 4096: 4421→4236 ms) — the model is activation/compute-bound, not
+  weight-bandwidth-bound. **Decision: ship fp16 + buckets.** Quant flags stay wired (storage-only).
 - [ ] **A6 — Swift SPM API + parity.** `PplxEmbed`: `[String] → int8/binary/ubinary` (plain +
   per-chunk context); bucket select + pad/mask; matches Python reference within tolerance.
 
 ## Section B — Extensions
 
-- [ ] **B1 — INT4 weight quant.** Flip `palettize_weights` (group_size=32); fidelity + ANE + latency.
+- [x] **B1 — INT4 weight quant: measured (0.905, below gate).** `palettize_weights` group_size=32
+  → cos 0.905 (< 0.990); ~4–8% latency. Folded into the A4/A5 weight-quant verdict above.
 - [ ] **B2 — Bucket expansion.** `{256,512,1024,2048,4096}`, skip-if-exists; per-bucket table.
 - [ ] **B3 — mMARCO calibration + multilingual retrieval eval.** nDCG@10 across languages,
   fp32/fp16/INT8/INT4, plain + context.
