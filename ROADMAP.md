@@ -28,8 +28,9 @@ Status of the `pplx-embed` fork work. See [`PPLX_EMBED.md`](PPLX_EMBED.md) for t
     L=4096 cpuAndNE — matches Python, i.e. real compute, not bridge overhead → see A2.
 - [x] **A2 — fp16 ANE residency.** L=4096 plain (fp16 + int8): **99.80% ANE** / 0.20% CPU
   (4 mask-glue ops). The 4.3 s latency is not a fallback — it is inherent O(L²) attention:
-  latency 512→**101 ms**, 1024→**259 ms**, 4096→**4272 ms** (73-tok input, cpuAndNE), so the
-  bucket strategy is a **42× win** for short inputs. ANE beats GPU 2.3× (1024: 258 ms vs
+  latency 512→**101 ms**, 1024→**259 ms**, 2048→**1372 ms**, 4096→**4340 ms** (73-tok input,
+  cpuAndNE) — blow-up concentrated at the 1024→2048 knee (5.3× per 2× L, super-quadratic; ANE
+  memory/tiling), so the bucket strategy is a **43× win** for short inputs. ANE beats GPU 2.3× (1024: 258 ms vs
   601 ms cpuAndGPU; `.all` picks ANE). EnumeratedShapes verdict: the encoder bakes L into
   RoPE/reshapes so flexible shapes need a rewrite — decision already backed by two siblings +
   this bucket data; a flexible-shape spike is optional.
