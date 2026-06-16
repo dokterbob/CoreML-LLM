@@ -23,6 +23,9 @@ let package = Package(
         // / `Gemma3BundleDownloader` directly, without pulling the sample CLIs.
         .executable(name: "functiongemma-demo", targets: ["FunctionGemmaDemo"]),
         .executable(name: "embeddinggemma-demo", targets: ["EmbeddingGemmaDemo"]),
+        // pplx-embed — Swift fidelity + latency harness for the native int8
+        // encoder output (not readable from the Python bridge on macOS26).
+        .executable(name: "pplx-embed-bench", targets: ["PplxEmbedBench"]),
     ],
     dependencies: [
         // Range widened to 1.0.x: mlx-swift-examples caps swift-transformers at
@@ -126,6 +129,14 @@ let package = Package(
             name: "AneResidencyGate",
             dependencies: ["CoreMLLLM"],
             path: "Sources/ane-residency-gate",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        // pplx-embed Swift fidelity + latency bench. No CoreMLLLM / tokenizer
+        // dependency — reads pre-tokenized fixtures (conversion/export_swift_fixtures.py),
+        // so it builds fast and stays self-contained.
+        .executableTarget(
+            name: "PplxEmbedBench",
+            path: "Sources/pplx-embed-bench",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]
