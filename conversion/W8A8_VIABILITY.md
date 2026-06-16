@@ -146,6 +146,35 @@ dead end without rotation/QAT).
 
 ---
 
+## Mitigation feasibility (researched 2026-06) + the latency reality
+
+Recovery candidates and — critically — whether they map to the ANE's fixed op set:
+
+| approach | recovery (LLM literature) | ANE-deployable? | effort |
+|---|---|---|---|
+| **SmoothQuant** — per-channel scale migrated activation→weight | W8A8 "negligible loss" on LLMs; "alone insufficient" for total collapse | yes (folds into weights, no runtime ops) | low |
+| **Rotation (QuaRot/SpinQuant)** | 4-bit ~99% zero-shot; 8-bit "negligible" (extrapolated) | **partial** — R1/R2 fold offline, but the down-proj/value-path **online Hadamards have no adjacent linear to absorb** → extra runtime ops the ANE may reject/spill; **no public QuaRot/SpinQuant-on-ANE precedent** | high |
+| **QAT + distillation** — distil from the fp32 teacher on **unlabeled** text (no labels/contrastive pipeline) | 8-bit "almost lossless"; total collapse likely needs **full** QAT, not LoRA | yes (weights only; deployed graph stays standard int8 matmul) | highest |
+
+QAT-distillation is the only path with **both** strong recovery and clean ANE deployment.
+
+### But the premise is wrong — int8 activations barely help here (MEASURED)
+
+W8A8 exists to buy ANE bandwidth via int8 *activations*. Measured (L=128, cpuAndNE):
+
+| precision | median latency |
+|---|---|
+| fp16 (pooled) | 14.0 ms |
+| W8A8 (int8 act) | 12.7 ms (**~9% faster**) |
+
+The ANE is fp16-native; int8-activation matmul is only marginally faster, and the attention
+score matmuls (activation×activation) that dominate at large L are not int8-accelerated at all.
+With weight quant's ~4–8%, the **whole quantization latency upside is ~10%** — not the 2× the
+bandwidth intuition suggests. So even a *perfect* fidelity recovery (weeks of QAT, or a rotation
+reimplementation that may not map to ANE) would buy ~10% latency. **Not worth it.** Ship fp16 +
+buckets (0.999, 99.8% ANE, 101 ms at L=512); revisit only if a future ANE accelerates int8
+compute, or if memory (not latency) becomes the binding constraint.
+
 ## Files
 
 - `conversion/experiment_w8a8.py` — builds + measures W8A8 fidelity, parametrized
