@@ -205,29 +205,32 @@ class Qwen3Encoder(nn.Module):
         self.register_buffer("cos_cached", emb.cos().to(MODEL_DTYPE))
         self.register_buffer("sin_cached", emb.sin().to(MODEL_DTYPE))
 
-    def _pad_mask(self, attention_mask: torch.Tensor) -> torch.Tensor:
-        """(1, L) {1 valid, 0 pad} → (1, 1, L, L) additive fp16 (0 / −1e4), key-side."""
-        L = self.config.max_seq_len
+    def _pad_mask(self, attention_mask: torch.Tensor, S: int) -> torch.Tensor:
+        """(1, S) {1 valid, 0 pad} → (1, 1, S, S) additive fp16 (0 / −1e4), key-side."""
         key_pad = (1.0 - attention_mask).to(MODEL_DTYPE) * self.NEG_INF
-        return key_pad.view(1, 1, 1, L).expand(1, 1, L, L)
+        return key_pad.view(1, 1, 1, S).expand(1, 1, S, S)
 
     def forward(
         self,
-        input_ids: torch.Tensor,       # (1, L) int32
-        attention_mask: torch.Tensor,  # (1, L) fp16
+        input_ids: torch.Tensor,       # (1, S) int32
+        attention_mask: torch.Tensor,  # (1, S) fp16
     ) -> torch.Tensor:
-        L = self.config.max_seq_len
+        # Derive the sequence length from the input, not config — this makes the
+        # same graph serve both fixed buckets (S == bucket, static) and a flexible
+        # RangeDim export (S dynamic, GPU). RoPE is precomputed up to max_seq_len
+        # (the rope table size) and sliced to S.
         head_dim = self.config.head_dim
+        S = input_ids.shape[1]
 
         # No embedding scaling (Qwen3). Keep residual stream in fp32.
         hidden = self.embed_tokens(input_ids).to(torch.float32)
 
-        cos = self.cos_cached.view(1, 1, L, head_dim)
-        sin = self.sin_cached.view(1, 1, L, head_dim)
-        mask = self._pad_mask(attention_mask)
+        cos = self.cos_cached[:S].view(1, 1, S, head_dim)
+        sin = self.sin_cached[:S].view(1, 1, S, head_dim)
+        mask = self._pad_mask(attention_mask, S)
 
         for layer in self.layers:
-            hidden = layer(hidden, cos, sin, mask, L)
+            hidden = layer(hidden, cos, sin, mask, S)
 
         return self.norm(hidden).to(MODEL_DTYPE)
 
