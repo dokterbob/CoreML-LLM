@@ -22,8 +22,10 @@ Status of the `pplx-embed` fork work. See [`PPLX_EMBED.md`](PPLX_EMBED.md) for t
     peak |h| ~12–14k (4.6–6.3× headroom) up to 1015 real tokens.
   - CoreML L=4096 (macOS26, fp16): int8 cos min **0.99912** / mean 0.99961 (gate 0.997);
     build 118 s; latency ~4.3 s warm (full 4096-length forward, token-count-independent).
-  - Native int8-output artifact builds (`dtype=INT8 [1,1024]`). Fidelity proven via the
-    Python-readable fp16 path; Swift int8 readback deferred to A6 (SPM runtime).
+  - Native int8-output artifact builds (`dtype=INT8 [1,1024]`).
+  - Swift bench (`pplx-embed-bench`) reads the native int8 output (Python bridge can't on
+    macOS26): int8 cos min **0.99912** / mean 0.99967 (PASS); latency median **4324 ms** at
+    L=4096 cpuAndNE — matches Python, i.e. real compute, not bridge overhead → see A2.
 - [ ] **A2 — fp16 ANE residency + EnumeratedShapes verdict.** Audit L=4096 plain; record
   CPU/GPU/ANE fractions; one fixed-vs-Enumerated comparison logged.
 - [ ] **A3 — Context variant (late chunking).** `pool_matrix [32,L]` in → `chunk_embeddings
