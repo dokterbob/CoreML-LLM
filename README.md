@@ -6,6 +6,10 @@ Where [MLX Swift](https://github.com/ml-explore/mlx-swift) is the right call whe
 
 [![App Store](https://toolbox.marketingtools.apple.com/api/v2/badges/download-on-the-app-store/black/en-us?releaseDate=1735689600)](https://apps.apple.com/jp/app/models-zoo/id6762083207)
 
+> **Fork note (`pplx-embed` branch):** this branch adds a bidirectional Qwen3 encoder path to run
+> Perplexity's `pplx-embed` embedding models on the ANE. See [`PPLX_EMBED.md`](PPLX_EMBED.md),
+> [`ROADMAP.md`](ROADMAP.md), and [`CLAUDE.md`](CLAUDE.md).
+
 ## Use in your app
 
 Add the package, name a model, generate.
