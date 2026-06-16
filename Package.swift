@@ -26,6 +26,12 @@ let package = Package(
         // pplx-embed — Swift fidelity + latency harness for the native int8
         // encoder output (not readable from the Python bridge on macOS26).
         .executable(name: "pplx-embed-bench", targets: ["PplxEmbedBench"]),
+        // pplx-embed — the official embedding contract (plain + context late
+        // chunking; int8/binary/ubinary). The `PplxEmbed` runtime ships inside
+        // the CoreMLLLM library; this product exposes it under its own name so a
+        // wrapper can depend on just the embedder without pulling the sample CLIs.
+        .library(name: "PplxEmbed", targets: ["CoreMLLLM"]),
+        .executable(name: "pplx-embed-demo", targets: ["PplxEmbedDemo"]),
     ],
     dependencies: [
         // Range widened to 1.0.x: mlx-swift-examples caps swift-transformers at
@@ -137,6 +143,18 @@ let package = Package(
         .executableTarget(
             name: "PplxEmbedBench",
             path: "Sources/pplx-embed-bench",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        // pplx-embed demo CLI — embeds a few strings (plain or context) and
+        // prints int8/binary/ubinary summaries. Uses the PplxEmbed runtime +
+        // tokenizer from the CoreMLLLM library.
+        .executableTarget(
+            name: "PplxEmbedDemo",
+            dependencies: [
+                "CoreMLLLM",
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ],
+            path: "Sources/pplx-embed-demo",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]
