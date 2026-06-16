@@ -14,8 +14,16 @@ Status of the `pplx-embed` fork work. See [`PPLX_EMBED.md`](PPLX_EMBED.md) for t
     `st_quantize.py`; `embed(["hello world"]) → (1,1024) int8`; late chunking matches the
     official `model.encode()` (cosine 1.0, ±1 int8 from matmul pooling).
   - `audit_ane_residency.py` verified on a real pplx-embed model (**99.4% ANE** on plain L512 fp16).
-- [ ] **A1 — Qwen3 bidirectional encoder, fp16, L=4096, PLAIN.** `models/qwen3_encoder.py` +
-  `build_pplx_embed_bundle.py`. Gate: cosine vs fp32 ≥ 0.997 (Swift harness, int8 output).
+- [x] **A1 — Qwen3 bidirectional encoder, fp16, L=4096, PLAIN.** `models/qwen3_encoder.py` +
+  `build_pplx_embed_bundle.py` + `test_pplx_embed_parity.py`.
+  - PyTorch parity (L=64): pooled cos min 0.99980, int8 min 0.99967, 0 NaN.
+  - fp16 fix: deep `down_proj` accumulation overflows fp16 (~layer 19);
+    `apply_fp16_residual_rescale` (K=16) — exact for pre-norm. Verified to plateau
+    peak |h| ~12–14k (4.6–6.3× headroom) up to 1015 real tokens.
+  - CoreML L=4096 (macOS26, fp16): int8 cos min **0.99912** / mean 0.99961 (gate 0.997);
+    build 118 s; latency ~4.3 s warm (full 4096-length forward, token-count-independent).
+  - Native int8-output artifact builds (`dtype=INT8 [1,1024]`). Fidelity proven via the
+    Python-readable fp16 path; Swift int8 readback deferred to A6 (SPM runtime).
 - [ ] **A2 — fp16 ANE residency + EnumeratedShapes verdict.** Audit L=4096 plain; record
   CPU/GPU/ANE fractions; one fixed-vs-Enumerated comparison logged.
 - [ ] **A3 — Context variant (late chunking).** `pool_matrix [32,L]` in → `chunk_embeddings
