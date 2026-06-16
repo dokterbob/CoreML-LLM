@@ -47,8 +47,11 @@ Status of the `pplx-embed` fork work. See [`PPLX_EMBED.md`](PPLX_EMBED.md) for t
   **0.905** — still below the 0.990 gate. And it does not matter: weight quant buys only **4–8%**
   latency (512: 102→94 ms; 4096: 4421→4236 ms) — the model is activation/compute-bound, not
   weight-bandwidth-bound. **Decision: ship fp16 + buckets.** Quant flags stay wired (storage-only).
-- [ ] **A6 — Swift SPM API + parity.** `PplxEmbed`: `[String] → int8/binary/ubinary` (plain +
-  per-chunk context); bucket select + pad/mask; matches Python reference within tolerance.
+- [x] **A6 — Swift SPM API + parity.** `Sources/CoreMLLLM/PplxEmbed.swift` + `pplx-embed-demo`.
+  `[String] → int8/binary/ubinary` (plain) and `[[String]] → per-chunk` (context); tokenize
+  (swift-transformers) → smallest-fitting bucket → pad/mask → CoreML → native int8; binary = sign,
+  ubinary = packbits (MSB-first); context builds the pool_matrix in Swift. Verified: builds clean,
+  demos run, Swift int8 vs Python reference cosine **0.99976/0.99981/0.99827** (PASS).
 
 ## Section B — Extensions
 
