@@ -52,12 +52,34 @@ Status of the `pplx-embed` fork work. See [`PPLX_EMBED.md`](PPLX_EMBED.md) for t
   (swift-transformers) → smallest-fitting bucket → pad/mask → CoreML → native int8; binary = sign,
   ubinary = packbits (MSB-first); context builds the pool_matrix in Swift. Verified: builds clean,
   demos run, Swift int8 vs Python reference cosine **0.99976/0.99981/0.99827** (PASS).
+  - **Dynamic routing (full size range).** `embed()` routes `n > largest bucket` → a flexible
+    RangeDim model on GPU (non-padded, up to 8192) built via `--dynamic-upper`; everything else →
+    smallest ANE bucket. Encoder refactored to derive seq-len (and batch) from the input. Verified:
+    2 tok 0.99976 (ANE), 1141 tok 0.99925 (ANE L2048), **3361 tok 0.99956 (dynamic GPU)**.
 
 ## Section B — Extensions
 
 - [x] **B1 — INT4 weight quant: measured (0.905, below gate).** `palettize_weights` group_size=32
   → cos 0.905 (< 0.990); ~4–8% latency. Folded into the A4/A5 weight-quant verdict above.
-- [ ] **B2 — Bucket expansion.** `{256,512,1024,2048,4096}`, skip-if-exists; per-bucket table.
+- [x] **B2 — Bucket expansion.** Built {512,1024,2048,4096}; per-bucket latency (cpuAndNE,
+  73-tok): 101/259/1372/4340 ms — O(L²), knee at L=1024→2048 (5.3× super-quadratic). Adding a
+  bucket is one CLI flag (`--max-seq-len`), skip-if-exists.
 - [ ] **B3 — mMARCO calibration + multilingual retrieval eval.** nDCG@10 across languages,
-  fp32/fp16/INT8/INT4, plain + context.
-- [ ] **B4 — (experiment) true W8A8 / A8.** Asymmetric activation quant; measure the ~cos 0.57 wall.
+  fp32/fp16/INT8/INT4, plain + context. *(Deferred — the one remaining open item.)*
+- [x] **B4 — W8A8 / A8: not viable.** All variants collapse to **cos ≈ 0** (worse than the ~0.57
+  wall and than weight-only int8); asym/sym and rescale-K make no difference. ANE residency fine
+  (94%) — purely numerical. Recovery needs full QAT (rotation needs online Hadamards the ANE can't
+  fold); and it's moot — int8 activations are only ~9% faster (not bandwidth-bound). See
+  `docs/PPLX_EMBED_W8A8.md`.
+
+## Post-plan findings (shape strategy + throughput)
+
+- [x] **Shape strategy verdict.** Flexible shapes are ~10× slower than fixed buckets:
+  EnumeratedShapes forces **CPU fallback** (measured: 969 ms @512 vs 101 ms ANE); RangeDim is slow
+  even warm (per-shape JIT). **Fixed ANE buckets are the only fast path** and beat the GPU at every
+  size (incl. past the knee). The dynamic RangeDim GPU model is purely the **>max-bucket catch-all**.
+- [x] **Throughput / batching.** Batching gives **no MLX-style gains** on CoreML: the ANE is
+  batch-1 by design (batching *hurts*, 0.69×, 100% on-ANE — not a fallback); CoreML GPU batches but
+  saturates at L≥256 (MLX's 8× fills an under-utilized GPU, N/A here); CPU/BLAS best at 1.6× off a
+  slow base. **ANE batch-1 at the smallest bucket (~72 docs/s @L128) is the throughput winner.**
+  See `docs/PPLX_EMBED_BATCHING.md`.
