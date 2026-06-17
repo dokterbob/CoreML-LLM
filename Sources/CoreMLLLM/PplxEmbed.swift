@@ -53,9 +53,10 @@ public final class PplxEmbed {
 
     /// Per-bundle config parsed from model_config.json.
     public struct BucketConfig: Sendable {
-        public let maxSeqLen: Int
+        public let maxSeqLen: Int    // for dynamic, the RangeDim upper bound
         public let embedDim: Int
         public let variant: String   // "plain" | "context"
+        public let dynamic: Bool     // flexible RangeDim model (GPU; the >max-bucket catch-all)
         public let url: URL
     }
 
@@ -66,19 +67,26 @@ public final class PplxEmbed {
     private let sepTokenId: Int
     private let computeUnits: MLComputeUnits
 
-    /// Available buckets, sorted ascending by maxSeqLen.
+    /// Fixed ANE buckets, sorted ascending by maxSeqLen.
     private let buckets: [BucketConfig]
+    /// Optional flexible RangeDim catch-all for inputs larger than the biggest
+    /// fixed bucket. Runs on the GPU (flexible shapes force CPU fallback on ANE),
+    /// non-padded (actual length). nil if no dynamic bundle was provided.
+    private let dynamicBucket: BucketConfig?
     private let variant: String
 
-    /// Lazily compiled+loaded models, keyed by bucket maxSeqLen.
+    /// Lazily compiled+loaded fixed-bucket models, keyed by bucket maxSeqLen.
     private var loaded: [Int: MLModel] = [:]
+    /// Lazily loaded dynamic model (GPU).
+    private var dynamicModel: MLModel?
     private let lock = NSLock()
 
     private init(tokenizer: Tokenizer, sepTokenId: Int, buckets: [BucketConfig],
-                 variant: String, computeUnits: MLComputeUnits) {
+                 dynamicBucket: BucketConfig?, variant: String, computeUnits: MLComputeUnits) {
         self.tokenizer = tokenizer
         self.sepTokenId = sepTokenId
         self.buckets = buckets
+        self.dynamicBucket = dynamicBucket
         self.variant = variant
         self.computeUnits = computeUnits
     }
@@ -124,17 +132,19 @@ public final class PplxEmbed {
                 "no pplx-embed bucket with encoder.mlpackage/.mlmodelc under \(bundleDir.path)")
         }
 
-        let variant = buckets.first!.variant
-        // Keep only buckets that match the dominant variant, sorted ascending.
-        let sorted = buckets.filter { $0.variant == variant }
-            .sorted { $0.maxSeqLen < $1.maxSeqLen }
+        // Dominant variant from the fixed buckets (a dynamic-only bundle is plain).
+        let variant = (buckets.first { !$0.dynamic } ?? buckets.first!).variant
+        let matching = buckets.filter { $0.variant == variant }
+        // Fixed ANE buckets (sorted ascending) + at most one dynamic GPU catch-all.
+        let fixed = matching.filter { !$0.dynamic }.sorted { $0.maxSeqLen < $1.maxSeqLen }
+        let dynamic = matching.first { $0.dynamic }
 
-        let hfDir = sorted.first!.url.appendingPathComponent("hf_model")
+        let hfDir = (fixed.first ?? dynamic!).url.appendingPathComponent("hf_model")
         let tokenizer = try await AutoTokenizer.from(modelFolder: hfDir)
         let sepId = sepTokenId(fromHFDir: hfDir) ?? 151643
 
-        return PplxEmbed(tokenizer: tokenizer, sepTokenId: sepId, buckets: sorted,
-                         variant: variant, computeUnits: computeUnits)
+        return PplxEmbed(tokenizer: tokenizer, sepTokenId: sepId, buckets: fixed,
+                         dynamicBucket: dynamic, variant: variant, computeUnits: computeUnits)
     }
 
     /// Parse a single bucket directory's model_config.json. Only accepts
@@ -153,15 +163,27 @@ public final class PplxEmbed {
         else { return nil }
 
         let outputMode = j["output_mode"] as? String ?? "int8"
-        guard outputMode == "int8" else { return nil }   // skip pooled_fp16 / quantized variants
+        guard outputMode == "int8" else { return nil }   // skip pooled_fp16 variants
+        // Ship the fp16-weight models only; skip experimental weight-quant bundles
+        // (they share output_mode "int8" but would duplicate a bucket size).
+        let weightQuant = j["quantization_weights"] as? String ?? "fp16"
+        guard weightQuant == "fp16" else { return nil }
 
-        let maxSeqLen = (j["bucket"] as? Int) ?? (j["max_seq_len"] as? Int) ?? 512
+        let dynamic = (j["dynamic"] as? Bool) ?? false
+        // Fixed bucket: integer "bucket". Dynamic: "bucket" is a string ("1..N");
+        // use dynamic_upper as the effective max.
+        let maxSeqLen: Int
+        if dynamic {
+            maxSeqLen = (j["dynamic_upper"] as? Int) ?? (j["max_seq_len"] as? Int) ?? 8192
+        } else {
+            maxSeqLen = (j["bucket"] as? Int) ?? (j["max_seq_len"] as? Int) ?? 512
+        }
         let embedDim = (j["hidden_size"] as? Int) ?? PplxEmbed.embedDim
         let variant = (j["variant"] as? String)
             ?? (dir.path.contains("context") ? "context" : "plain")
 
         return BucketConfig(maxSeqLen: maxSeqLen, embedDim: embedDim,
-                            variant: variant, url: dir)
+                            variant: variant, dynamic: dynamic, url: dir)
     }
 
     private static func sepTokenId(fromHFDir hfDir: URL) -> Int? {
@@ -203,6 +225,22 @@ public final class PplxEmbed {
         try MLModel.compileModel(at: pkg)
     }
 
+    /// Load the flexible RangeDim catch-all model on the GPU (flexible shapes
+    /// force CPU fallback on the ANE, so this path is GPU-only).
+    private func loadDynamicModel(_ cfg: BucketConfig) throws -> MLModel {
+        lock.lock(); defer { lock.unlock() }
+        if let m = dynamicModel { return m }
+        let mlConfig = MLModelConfiguration()
+        mlConfig.computeUnits = .cpuAndGPU
+        let compiled = cfg.url.appendingPathComponent("encoder.mlmodelc")
+        let pkg = cfg.url.appendingPathComponent("encoder.mlpackage")
+        let url = FileManager.default.fileExists(atPath: compiled.path)
+            ? compiled : try compileSync(pkg)
+        let m = try MLModel(contentsOf: url, configuration: mlConfig)
+        dynamicModel = m
+        return m
+    }
+
     /// Pick the smallest bucket whose maxSeqLen >= n; if none, the largest.
     private func bucket(forTokens n: Int) -> BucketConfig {
         for b in buckets where b.maxSeqLen >= n { return b }
@@ -234,23 +272,38 @@ public final class PplxEmbed {
 
     private func embedOne(_ text: String) throws -> [Int8] {
         var ids = tokenizer.encode(text: text)
+        let largestFixed = buckets.last?.maxSeqLen ?? 0
+
+        // Catch-all: inputs larger than the biggest fixed bucket go to the flexible
+        // GPU model, non-padded (actual length, capped at the RangeDim upper bound).
+        if let dyn = dynamicBucket, ids.count > largestFixed {
+            let L = min(ids.count, dyn.maxSeqLen)
+            if ids.count > L { ids = Array(ids.prefix(L)) }
+            let n = ids.count
+            let out = try loadDynamicModel(dyn).prediction(from: MLDictionaryFeatureProvider(dictionary: [
+                "input_ids": try makeInputIds(ids, L: n),
+                "attention_mask": try makeAttentionMask(n: n, L: n),
+            ]))
+            return try readPlainRow(out)
+        }
+
+        // Fast path: smallest fixed ANE bucket that fits, padded to the bucket.
         let bucket = bucket(forTokens: ids.count)
         let L = bucket.maxSeqLen
         if ids.count > L { ids = Array(ids.prefix(L)) }
         let n = ids.count
-
-        let inputIds = try makeInputIds(ids, L: L)
-        let attn = try makeAttentionMask(n: n, L: L)
-
-        let model = try model(forBucket: L)
-        let out = try model.prediction(from: MLDictionaryFeatureProvider(dictionary: [
-            "input_ids": inputIds,
-            "attention_mask": attn,
+        let out = try model(forBucket: L).prediction(from: MLDictionaryFeatureProvider(dictionary: [
+            "input_ids": try makeInputIds(ids, L: L),
+            "attention_mask": try makeAttentionMask(n: n, L: L),
         ]))
+        return try readPlainRow(out)
+    }
+
+    /// Read a (1, 1024) int8 "embedding" output into [Int8].
+    private func readPlainRow(_ out: MLFeatureProvider) throws -> [Int8] {
         guard let arr = out.featureValue(for: "embedding")?.multiArrayValue else {
             throw CoreMLLLMError.predictionFailed
         }
-        // (1, 1024) int8 → first 1024 values.
         let d = min(PplxEmbed.embedDim, arr.count)
         var vec = [Int8](repeating: 0, count: d)
         for i in 0..<d { vec[i] = Int8(arr[i].int8Value) }
