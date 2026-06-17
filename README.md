@@ -1,14 +1,12 @@
 # CoreML-LLM
 
-**On-device LLMs on the Apple Neural Engine.** Run Gemma 4, Qwen3.5, Qwen3-VL, FunctionGemma, EmbeddingGemma, and Liquid AI's LFM2.5 on iPhone with CoreML — ANE-first, battery-friendly, no server.
+**On-device LLMs on the Apple Neural Engine.** Run Gemma 4, Qwen3.5, Qwen3-VL, FunctionGemma, EmbeddingGemma, Perplexity pplx-embed, and Liquid AI's LFM2.5 on iPhone with CoreML — ANE-first, battery-friendly, no server.
 
 Where [MLX Swift](https://github.com/ml-explore/mlx-swift) is the right call when you want maximum GPU throughput, CoreML-LLM is what you use when the LLM should live on the **ANE** so the GPU stays free for the rest of the app.
 
 [![App Store](https://toolbox.marketingtools.apple.com/api/v2/badges/download-on-the-app-store/black/en-us?releaseDate=1735689600)](https://apps.apple.com/jp/app/models-zoo/id6762083207)
 
-> **Fork note (`pplx-embed` branch):** this branch adds a bidirectional Qwen3 encoder path to run
-> Perplexity's `pplx-embed` embedding models on the ANE. See [`PPLX_EMBED.md`](PPLX_EMBED.md),
-> [`ROADMAP.md`](ROADMAP.md), and [`CLAUDE.md`](CLAUDE.md).
+**Embeddings:** Perplexity's `pplx-embed` (bidirectional Qwen3 encoder, plain + late-chunking) runs on the ANE via the `PplxEmbed` Swift API — see [`docs/PPLX_EMBED.md`](docs/PPLX_EMBED.md).
 
 ## Use in your app
 
