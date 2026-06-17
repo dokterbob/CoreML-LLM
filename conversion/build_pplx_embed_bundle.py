@@ -64,8 +64,17 @@ def build_bundle(
     rescale_k: float = DEFAULT_RESCALE_K,
     quantize: str | None = None,
     variant: str = "plain",
+    dynamic_upper: int = 0,
     skip_if_exists: bool = True,
 ) -> str:
+    """Build a CoreML bundle.
+
+    dynamic_upper > 0 → a **flexible RangeDim** model (seq 1..dynamic_upper) targeting the
+    GPU — the non-padded, unbounded-length catch-all for inputs larger than the biggest fixed
+    ANE bucket. (Flexible shapes force CPU fallback on ANE and are ~10× slower than fixed
+    buckets, so this is GPU-only and reserved for >max-bucket inputs.) Otherwise a fixed-shape
+    bucket (the fast ANE path).
+    """
     import coremltools as ct
 
     os.makedirs(output_dir, exist_ok=True)
@@ -74,9 +83,13 @@ def build_bundle(
         print(f"  [skip] {pkg} exists")
         return pkg
 
-    print(f"[1/4] Loading {hf_repo} (config + weights; variant={variant})")
+    dynamic = dynamic_upper > 0
+    print(f"[1/4] Loading {hf_repo} (config + weights; variant={variant}"
+          + (f", dynamic RangeDim 1..{dynamic_upper} GPU" if dynamic else "") + ")")
     snap = hf_repo if os.path.isdir(hf_repo) else _snapshot_dir(hf_repo)
-    cfg = Qwen3EncoderConfig.from_json(os.path.join(snap, "config.json"), max_seq_len=max_seq_len)
+    # RoPE table must cover the largest sequence: the bucket, or the dynamic upper bound.
+    rope_len = dynamic_upper if dynamic else max_seq_len
+    cfg = Qwen3EncoderConfig.from_json(os.path.join(snap, "config.json"), max_seq_len=rope_len)
     if variant == "context":
         model = PplxEmbedContextModel(cfg, output_mode=output_mode).eval()
     else:
@@ -86,31 +99,47 @@ def build_bundle(
         print(f"[1.5/4] fp16 residual rescale 1/K (K={rescale_k})")
         apply_fp16_residual_rescale(model.encoder, rescale_k)
 
-    print(f"[2/4] Tracing (L={max_seq_len}, mode={output_mode}, variant={variant})")
-    sample_ids = torch.zeros((1, max_seq_len), dtype=torch.int32)
-    sample_mask = torch.ones((1, max_seq_len), dtype=torch.float16)
-    inputs = [
-        ct.TensorType(name="input_ids", shape=(1, max_seq_len), dtype=np.int32),
-        ct.TensorType(name="attention_mask", shape=(1, max_seq_len), dtype=np.float16),
-    ]
-    if variant == "context":
-        sample_pool = torch.zeros((N_MAX_CHUNKS, max_seq_len), dtype=torch.float16)
-        sample_pool[0, :] = 1.0 / max_seq_len
-        trace_args = (sample_ids, sample_mask, sample_pool)
-        inputs.append(ct.TensorType(name="pool_matrix", shape=(N_MAX_CHUNKS, max_seq_len), dtype=np.float16))
-    else:
+    if dynamic and variant == "context":
+        raise ValueError("dynamic (RangeDim) mode supports only the plain variant")
+
+    trace_len = min(512, dynamic_upper) if dynamic else max_seq_len
+    print(f"[2/4] Tracing (trace_len={trace_len}, mode={output_mode}, variant={variant}"
+          + (f", RangeDim 1..{dynamic_upper}" if dynamic else "") + ")")
+    sample_ids = torch.zeros((1, trace_len), dtype=torch.int32)
+    sample_mask = torch.ones((1, trace_len), dtype=torch.float16)
+    if dynamic:
+        seqdim = ct.RangeDim(lower_bound=1, upper_bound=dynamic_upper, default=trace_len)
+        inputs = [
+            ct.TensorType(name="input_ids", shape=(1, seqdim), dtype=np.int32),
+            ct.TensorType(name="attention_mask", shape=(1, seqdim), dtype=np.float16),
+        ]
         trace_args = (sample_ids, sample_mask)
+    else:
+        inputs = [
+            ct.TensorType(name="input_ids", shape=(1, trace_len), dtype=np.int32),
+            ct.TensorType(name="attention_mask", shape=(1, trace_len), dtype=np.float16),
+        ]
+        if variant == "context":
+            sample_pool = torch.zeros((N_MAX_CHUNKS, trace_len), dtype=torch.float16)
+            sample_pool[0, :] = 1.0 / trace_len
+            trace_args = (sample_ids, sample_mask, sample_pool)
+            inputs.append(ct.TensorType(name="pool_matrix", shape=(N_MAX_CHUNKS, trace_len), dtype=np.float16))
+        else:
+            trace_args = (sample_ids, sample_mask)
     with torch.no_grad():
         traced = torch.jit.trace(model, trace_args)
 
     out_dtype = np.int8 if output_mode == "int8" else np.float16
-    print(f"[3/4] Converting to CoreML (fp16, macOS26, stateless; out={out_dtype.__name__})")
+    # Flexible shapes can't go on ANE (CPU fallback) → GPU; fixed buckets → ANE (ALL picks it).
+    compute_units = ct.ComputeUnit.CPU_AND_GPU if dynamic else ct.ComputeUnit.ALL
+    print(f"[3/4] Converting to CoreML (fp16, macOS26; out={out_dtype.__name__}; "
+          f"units={'CPU_AND_GPU' if dynamic else 'ALL'})")
     mlmodel = ct.convert(
         traced,
         inputs=inputs,
         outputs=[ct.TensorType(name="embedding", dtype=out_dtype)],
         minimum_deployment_target=ct.target.macOS26,
-        compute_units=ct.ComputeUnit.ALL,
+        compute_units=compute_units,
     )
 
     if quantize == "int4":
@@ -132,19 +161,21 @@ def build_bundle(
     print(f"  saved {pkg} ({size_mb:.1f} MB)")
 
     _write_model_config(output_dir, model_name, hf_repo, cfg, max_seq_len,
-                        output_mode, rescale_k, quantize, variant)
+                        output_mode, rescale_k, quantize, variant, dynamic_upper)
     _copy_tokenizer(snap, output_dir)
     print(f"[4/4] bundle ready at {output_dir}")
     return pkg
 
 
 def _write_model_config(output_dir, model_name, hf_repo, cfg, max_seq_len,
-                        output_mode, rescale_k, quantize, variant="plain"):
+                        output_mode, rescale_k, quantize, variant="plain", dynamic_upper=0):
+    dynamic = dynamic_upper > 0
     out_dtype = "int8" if output_mode == "int8" else "fp16"
     out_shape = [N_MAX_CHUNKS, 1024] if variant == "context" else [1, 1024]
+    seq_shape = [1, f"1..{dynamic_upper}"] if dynamic else [1, max_seq_len]
     inputs = {
-        "input_ids": {"shape": [1, max_seq_len], "dtype": "int32"},
-        "attention_mask": {"shape": [1, max_seq_len], "dtype": "fp16",
+        "input_ids": {"shape": seq_shape, "dtype": "int32"},
+        "attention_mask": {"shape": seq_shape, "dtype": "fp16",
                            "doc": "1.0 for valid tokens, 0.0 for pad"},
     }
     if variant == "context":
@@ -175,13 +206,16 @@ def _write_model_config(output_dir, model_name, hf_repo, cfg, max_seq_len,
         "rope_theta": cfg.rope_theta,
         "rms_norm_eps": cfg.rms_norm_eps,
         "max_seq_len": max_seq_len,
-        "bucket": max_seq_len,
+        "bucket": (f"1..{dynamic_upper}" if dynamic else max_seq_len),
+        "dynamic": dynamic,
+        "dynamic_upper": dynamic_upper if dynamic else 0,
         "output_mode": output_mode,
         "fp16_residual_rescale_k": rescale_k,
         "pooling": "mean",
         "quantization_weights": quantize or "fp16",
         "matryoshka_dims": [1024, 512, 256, 128],
-        "compute_units": "CPU_AND_NE",
+        # Flexible RangeDim models force CPU fallback on ANE → run on GPU; fixed buckets on ANE.
+        "compute_units": "CPU_AND_GPU" if dynamic else "CPU_AND_NE",
     }
     path = os.path.join(output_dir, "model_config.json")
     with open(path, "w") as f:
@@ -212,6 +246,9 @@ def main():
     ap.add_argument("--quantize", default="none", choices=["none", "int8", "int4"])
     ap.add_argument("--variant", default="auto", choices=["auto", "plain", "context"],
                     help="auto → context if the model name contains 'context', else plain")
+    ap.add_argument("--dynamic-upper", type=int, default=0,
+                    help="If >0, build a flexible RangeDim (1..N) GPU model (the >max-bucket "
+                         "catch-all), e.g. 8192. Plain only.")
     ap.add_argument("--hf-dir", default=None, help="Override HF dir (skip download)")
     ap.add_argument("--output", default=None)
     ap.add_argument("--no-skip", action="store_true", help="Rebuild even if exists")
@@ -220,12 +257,15 @@ def main():
     reg = MODEL_REGISTRY[args.model]
     hf_repo = args.hf_dir or reg.hf_repo
     variant = ("context" if "context" in args.model else "plain") if args.variant == "auto" else args.variant
-    output = args.output or os.path.join(
-        ROOT, "..", "output", args.model,
-        f"L{args.max_seq_len}-{args.output_mode}" + (f"-{args.quantize}" if args.quantize != "none" else ""))
+    if args.dynamic_upper:
+        tag = f"dyn{args.dynamic_upper}-{args.output_mode}"
+    else:
+        tag = f"L{args.max_seq_len}-{args.output_mode}" + (f"-{args.quantize}" if args.quantize != "none" else "")
+    output = args.output or os.path.join(ROOT, "..", "output", args.model, tag)
     quantize = None if args.quantize == "none" else args.quantize
     build_bundle(hf_repo, args.model, output, args.max_seq_len, args.output_mode,
-                 args.rescale_k, quantize, variant=variant, skip_if_exists=not args.no_skip)
+                 args.rescale_k, quantize, variant=variant, dynamic_upper=args.dynamic_upper,
+                 skip_if_exists=not args.no_skip)
 
 
 if __name__ == "__main__":
