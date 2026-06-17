@@ -179,4 +179,4 @@ compute, or if memory (not latency) becomes the binding constraint.
 
 - `conversion/experiment_w8a8.py` — builds + measures W8A8 fidelity, parametrized
   (`--mode`, `--rescale-k`, `--bucket`, `--all`), saves `.mlpackage` artifacts for ANE audit.
-- `conversion/W8A8_VIABILITY.md` — this note.
+- `docs/PPLX_EMBED_W8A8.md` — this note.
