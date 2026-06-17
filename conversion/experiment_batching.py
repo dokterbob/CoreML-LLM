@@ -164,8 +164,30 @@ def _iter_ops(ms):
                     stack.append(nb)
 
 
+_COMPILE_CACHE: dict[str, str] = {}
+
+
+def _compiled_path(pkg: str) -> str:
+    """Compile an .mlpackage to a persistent .mlmodelc once (MLComputePlan needs
+    a compiled model, and the temp one from get_compiled_model_path() is deleted
+    when its MLModel is GC'd — so copy it to a stable location)."""
+    if pkg in _COMPILE_CACHE:
+        return _COMPILE_CACHE[pkg]
+    import shutil
+    m = ct.models.MLModel(pkg, compute_units=ct.ComputeUnit.CPU_ONLY)
+    tmp = m.get_compiled_model_path()
+    dst = pkg.replace(".mlpackage", ".mlmodelc")
+    if os.path.exists(dst):
+        shutil.rmtree(dst)
+    shutil.copytree(tmp, dst)   # copy before `m` is GC'd / tmp is cleaned
+    del m
+    _COMPILE_CACHE[pkg] = dst
+    return dst
+
+
 def audit_devices(pkg: str, compute_unit: ct.ComputeUnit) -> Counter:
-    plan = MLComputePlan.load_from_path(path=pkg, compute_units=compute_unit)
+    path = _compiled_path(pkg) if pkg.endswith(".mlpackage") else pkg
+    plan = MLComputePlan.load_from_path(path=path, compute_units=compute_unit)
     ms = plan.model_structure
     by_dev = Counter()
     for op in _iter_ops(ms):
