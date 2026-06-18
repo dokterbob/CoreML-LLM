@@ -71,5 +71,5 @@ ANE. Inputs larger than the biggest bucket are routed to the flexible RangeDim m
   highest-throughput path; batching is not a useful lever on CoreML (see below).
 
 See [`PPLX_EMBED_W8A8.md`](PPLX_EMBED_W8A8.md) (weight/activation quantization is not viable for
-this model) and [`PPLX_EMBED_BATCHING.md`](PPLX_EMBED_BATCHING.md) (no MLX-style batching gains;
-the ANE is batch-1 by design).
+this model) and [`PPLX_EMBED_BATCHING.md`](PPLX_EMBED_BATCHING.md) (batching is not a useful
+throughput lever — the ANE is batch-1 by design).
