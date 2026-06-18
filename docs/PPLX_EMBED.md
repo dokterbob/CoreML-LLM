@@ -80,9 +80,14 @@ Publish with `conversion/upload_pplx_embed.py` (single repo, per-bucket subfolde
 ship both `.mlmodelc`+`.mlpackage`): it compiles, **stages a clean repo tree** (hardlinks +
 `manifest.json` + README card), ensures the repo exists, and prints a resumable
 `hf upload-large-folder <repo> <stage> --repo-type=model` command (parallel, xet-accelerated,
-realtime progress; re-run to resume). Each bucket is a distinct ~1.19 GB — the RoPE table is baked
-into `weight.bin` and scales with `max_seq_len`, so buckets do **not** share weights; the
-`.mlmodelc` and `.mlpackage` of one bucket *do* share it (LFS-deduped).
+realtime progress; re-run to resume). Every bucket's `weight.bin` is now **byte-identical** (the
+RoPE cos/sin tables are built once to a fixed length — `max_position_embeddings`, 32768 — and
+gathered to `S` at runtime via `position_ids` derived from `attention_mask`, so they no longer scale
+with `max_seq_len`; verified L512≡L1024 by sha256). So HF LFS stores the ~1.2 GB blob **once** across
+all buckets (was ~7 GB for 6 buckets), and `.mlmodelc`↔`.mlpackage` within a bucket still dedup too.
+The runtime gather is fold-proof — a plain static `[:S]` slice gets const-folded back to a per-bucket
+constant — and needs no new model input / Swift change. Fidelity unchanged (CoreML L512 cosine vs the
+fp32 oracle 0.99996; ANE residency 99.3%).
 
 ## Design notes
 

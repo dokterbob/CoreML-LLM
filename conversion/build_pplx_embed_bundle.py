@@ -88,10 +88,14 @@ def build_bundle(
     print(f"[1/4] Loading {hf_repo} (config + weights; variant={variant}"
           + (f", dynamic RangeDim 1..{dynamic_upper} GPU" if dynamic else "") + ")")
     snap = hf_repo if os.path.isdir(hf_repo) else _snapshot_dir(hf_repo)
-    # RoPE table must cover the largest sequence: the bucket, or the dynamic upper bound.
-    rope_len = dynamic_upper if dynamic else max_seq_len
+    # The bucket (input shape). The RoPE table is built once to a fixed length
+    # (max_position_embeddings) inside Qwen3Encoder._build_rope and gathered to S at
+    # runtime, so it no longer tracks the bucket — that keeps weight.bin byte-identical
+    # across buckets (HF LFS stores one blob). For the dynamic RangeDim model max_seq_len
+    # is informational only (the input is RangeDim 1..dynamic_upper).
+    bucket_len = dynamic_upper if dynamic else max_seq_len
     cfg = Qwen3EncoderConfig.from_json(os.path.join(snap, "config.json"),
-                                       max_seq_len=rope_len, norm_impl=norm_impl)
+                                       max_seq_len=bucket_len, norm_impl=norm_impl)
     if variant == "context":
         model = PplxEmbedContextModel(cfg, output_mode=output_mode).eval()
     else:

@@ -262,7 +262,14 @@ class Qwen3Encoder(nn.Module):
 
     def _build_rope(self, config: Qwen3EncoderConfig):
         head_dim = config.head_dim
-        L = config.max_seq_len
+        # RoPE table size is DECOUPLED from the bucket (max_seq_len). We always build
+        # it to a single fixed length (max_position_embeddings, 32768) so the baked
+        # cos/sin constants are byte-identical across every bucket — that makes the
+        # whole CoreML weight.bin identical across buckets, so HF LFS / on-disk store
+        # it once instead of one ~1.19 GB blob per L. forward() slices [:S] at trace
+        # time; a runtime position_ids `gather` keeps that slice from being const-
+        # folded back into a per-bucket [S, head_dim] constant (verified by sha256).
+        L = config.max_position_embeddings
         t = torch.arange(L).float()
         inv = 1.0 / (config.rope_theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
         freqs = torch.einsum("i,j->ij", t, inv)
@@ -283,16 +290,27 @@ class Qwen3Encoder(nn.Module):
     ) -> torch.Tensor:
         # Derive the sequence length from the input, not config — this makes the
         # same graph serve both fixed buckets (S == bucket, static) and a flexible
-        # RangeDim export (S dynamic, GPU). RoPE is precomputed up to max_seq_len
-        # (the rope table size) and sliced to S.
+        # RangeDim export (S dynamic, GPU).
         head_dim = self.config.head_dim
         S = input_ids.shape[1]
 
         # No embedding scaling (Qwen3). Keep residual stream in fp32.
         hidden = self.embed_tokens(input_ids).to(torch.float32)
 
-        cos = self.cos_cached[:S].view(1, 1, S, head_dim)
-        sin = self.sin_cached[:S].view(1, 1, S, head_dim)
+        # RoPE: the cos/sin tables are built once to a FIXED length
+        # (max_position_embeddings, 32768) so they are byte-identical across every
+        # bucket — that makes the whole CoreML weight.bin identical across buckets.
+        # A plain static `cos_cached[:S]` slice would be const-folded back into a
+        # per-bucket [S, head_dim] constant (verified: it defeats the dedup). To keep
+        # the slice fold-proof we GATHER rows [0..S-1] using position_ids derived from
+        # a runtime input (attention_mask), so the indices are runtime-dependent and
+        # coremltools cannot const-fold the gather. This needs NO new model input.
+        position_ids = (
+            torch.cumsum(torch.ones_like(attention_mask, dtype=torch.float32), dim=1) - 1.0
+        ).to(torch.int32)                                  # (1, S) = [[0,1,…,S-1]]
+        pos = position_ids[0]                              # (S,)
+        cos = self.cos_cached.index_select(0, pos).view(1, 1, S, head_dim)
+        sin = self.sin_cached.index_select(0, pos).view(1, 1, S, head_dim)
         mask = self._pad_mask(attention_mask, S)
 
         for layer in self.layers:
