@@ -47,9 +47,11 @@ func summarize(_ v: [Int8]) -> String {
     return "dim=\(v.count) first8=[\(head)] l2=\(String(format: "%.2f", l2norm(v)))"
 }
 
+// Either --bundle-dir (local) or --repo (download from HuggingFace) is required.
 let bundleDir = arg("--bundle-dir", "")
-guard !bundleDir.isEmpty else {
-    FileHandle.standardError.write("--bundle-dir required\n".data(using: .utf8)!)
+let repo = arg("--repo", "")
+guard !bundleDir.isEmpty || !repo.isEmpty else {
+    FileHandle.standardError.write("--bundle-dir or --repo required\n".data(using: .utf8)!)
     exit(2)
 }
 let texts = args("--text")
@@ -62,8 +64,30 @@ let format = PplxEmbed.Format(rawValue: arg("--format", "int8")) ?? .int8
 let cu = computeUnits(arg("--compute-units", "cpuAndNE"))
 let asJSON = flag("--json")   // emit raw int8 vectors as JSON (for parity checks)
 
-let embedder = try await PplxEmbed.load(
-    bundleDir: URL(fileURLWithPath: bundleDir), computeUnits: cu)
+let embedder: PplxEmbed
+if !repo.isEmpty {
+    // Download-then-run: pull only the requested buckets from HF, then load.
+    let buckets = args("--buckets").compactMap { Int($0) }
+    let cacheDir = URL(fileURLWithPath: arg("--cache-dir",
+        FileManager.default.temporaryDirectory.appendingPathComponent("pplx-embed-cache").path))
+    let hfToken = args("--hf-token").first ?? ProcessInfo.processInfo.environment["HF_TOKEN"]
+    embedder = try await PplxEmbed.load(
+        repo: repo,
+        buckets: buckets.isEmpty ? [512, 1024, 2048] : buckets,
+        into: cacheDir,
+        computeUnits: cu,
+        variant: isContext ? "context" : "plain",
+        hfToken: hfToken,
+        onProgress: { p in
+            let pct = p.bytesTotal > 0 ? Int(100 * p.bytesReceived / p.bytesTotal) : 0
+            FileHandle.standardError.write("\r[download] \(pct)% \(p.currentFile)        "
+                .data(using: .utf8)!)
+        })
+    FileHandle.standardError.write("\n".data(using: .utf8)!)
+} else {
+    embedder = try await PplxEmbed.load(
+        bundleDir: URL(fileURLWithPath: bundleDir), computeUnits: cu)
+}
 
 // JSON mode: dump int8 vectors only (plain: [[Int8]]; context: [[[Int8]]]).
 if asJSON {

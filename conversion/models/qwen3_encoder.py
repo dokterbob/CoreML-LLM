@@ -38,7 +38,6 @@ from ane_ops import (  # noqa: E402
     MODEL_DTYPE,
     ANERMSNorm,
     apply_rotary_pos_emb,
-    repeat_kv_ane,
     stable_attention,
 )
 
@@ -53,6 +52,51 @@ def _repeat_kv_b(x: torch.Tensor, n_rep: int, B: int, num_kv_heads: int,
         return x
     x = x.unsqueeze(2).expand(B, num_kv_heads, n_rep, seq_len, head_dim)
     return x.reshape(B, num_kv_heads * n_rep, seq_len, head_dim)
+
+
+class Qwen3RMSNorm(nn.Module):
+    """Native RMSNorm `x * rsqrt(mean(x²)+eps) * w`, computed in fp32 (HF Qwen3 parity).
+
+    A *local* A/B alternative to the shared `ane_ops.ANERMSNorm` cat([x,−x])→LayerNorm
+    trick. That trick was chosen years ago because the ANE had a highly-optimized
+    LayerNorm kernel and no native `rsqrt`; on current M4 Max / macOS 26 / coremltools 9
+    that may no longer hold (see docs/PPLX_EMBED_GPU_RESIDENCY.md). This class lets the
+    pplx-embed encoder switch the 5 norm sites to native RMSNorm and measure.
+
+    It stores a 1-D fp16 weight exactly like `ANERMSNorm`, so weight loading is
+    unchanged (both are a plain `.weight` of shape `(hidden,)`). The normalization is
+    done in fp32 (fp16 `x²` can overflow for large activations) and returned in the
+    input dtype, mirroring the HF Qwen3 RMSNorm the fp32 reference already matches.
+    NB: coremltools lowers the whole graph to fp16 at convert time, so the fp32 here is
+    a trace-time/fidelity nicety; on device the op runs in fp16 like the rest.
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=MODEL_DTYPE))
+        self.eps = eps
+        self.hidden_size = hidden_size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        in_dtype = x.dtype
+        x = x.to(torch.float32)
+        var = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(var + self.eps)
+        return x.to(in_dtype) * self.weight
+
+
+def make_norm(norm_impl: str, hidden_size: int, eps: float) -> nn.Module:
+    """Select the RMSNorm implementation for the encoder's 5 local norm sites.
+
+    "ane_cat" (default) → shared `ANERMSNorm` (cat/chunk LayerNorm trick, unchanged
+    behavior). "native" → local `Qwen3RMSNorm` (native rsqrt). Both store a 1-D fp16
+    weight, so swapping does not affect weight loading.
+    """
+    if norm_impl == "native":
+        return Qwen3RMSNorm(hidden_size, eps=eps)
+    if norm_impl == "ane_cat":
+        return ANERMSNorm(hidden_size, eps=eps)
+    raise ValueError(f"Unknown norm_impl '{norm_impl}'; expected 'ane_cat' or 'native'.")
 
 
 class Qwen3EncoderConfig:
@@ -74,13 +118,23 @@ class Qwen3EncoderConfig:
         self.max_position_embeddings = kwargs.get("max_position_embeddings", 32768)
         # Trace-time fixed sequence length (the bucket).
         self.max_seq_len = kwargs.get("max_seq_len", 4096)
+        # RMSNorm implementation for the 5 local norm sites: "native" (local
+        # Qwen3RMSNorm, native rsqrt — the shipped default) or "ane_cat" (shared
+        # ANERMSNorm cat/chunk LayerNorm trick). native is the default because the A/B
+        # (experiment_ane_rmsnorm.py / docs/PPLX_EMBED_GPU_RESIDENCY.md follow-up) found
+        # it 12.7% (L=256) / 21.5% (L=512) faster on the ANE at identical 99.81%
+        # residency and cosine 0.99998 vs the fp32 oracle, on M4 Max / macOS 26 /
+        # coremltools 9. (The cat/chunk trick predates a native ANE rsqrt.)
+        self.norm_impl = kwargs.get("norm_impl", "native")
 
     @classmethod
-    def from_json(cls, path: str, max_seq_len: int = 4096) -> "Qwen3EncoderConfig":
+    def from_json(cls, path: str, max_seq_len: int = 4096,
+                  norm_impl: str = "native") -> "Qwen3EncoderConfig":
         with open(path) as f:
             d = json.load(f)
         d = d.get("text_config", d)
         d["max_seq_len"] = max_seq_len
+        d["norm_impl"] = norm_impl
         return cls(**d)
 
 
@@ -96,6 +150,7 @@ class Qwen3EncoderLayer(nn.Module):
         inter = config.intermediate_size
         eps = config.rms_norm_eps
         has_bias = config.attention_bias
+        norm_impl = config.norm_impl
 
         q_dim = num_heads * head_dim
         kv_dim = num_kv_heads * head_dim
@@ -106,16 +161,16 @@ class Qwen3EncoderLayer(nn.Module):
             "v_proj": nn.Conv2d(hidden, kv_dim, 1, bias=has_bias, dtype=MODEL_DTYPE),
             "o_proj": nn.Conv2d(q_dim, hidden, 1, bias=False, dtype=MODEL_DTYPE),
             # Qwen3 QK-norm: per-head RMSNorm over head_dim, plain weight.
-            "q_norm": ANERMSNorm(head_dim, eps=eps),
-            "k_norm": ANERMSNorm(head_dim, eps=eps),
+            "q_norm": make_norm(norm_impl, head_dim, eps),
+            "k_norm": make_norm(norm_impl, head_dim, eps),
         })
         self.mlp = nn.ModuleDict({
             "gate_proj": nn.Conv2d(hidden, inter, 1, bias=False, dtype=MODEL_DTYPE),
             "up_proj": nn.Conv2d(hidden, inter, 1, bias=False, dtype=MODEL_DTYPE),
             "down_proj": nn.Conv2d(inter, hidden, 1, bias=False, dtype=MODEL_DTYPE),
         })
-        self.input_layernorm = ANERMSNorm(hidden, eps=eps)
-        self.post_attention_layernorm = ANERMSNorm(hidden, eps=eps)
+        self.input_layernorm = make_norm(norm_impl, hidden, eps)
+        self.post_attention_layernorm = make_norm(norm_impl, hidden, eps)
 
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -202,7 +257,7 @@ class Qwen3Encoder(nn.Module):
         self.layers = nn.ModuleList(
             [Qwen3EncoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
-        self.norm = ANERMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = make_norm(config.norm_impl, config.hidden_size, eps=config.rms_norm_eps)
         self._build_rope(config)
 
     def _build_rope(self, config: Qwen3EncoderConfig):
@@ -398,6 +453,7 @@ def apply_fp16_residual_rescale(encoder: Qwen3Encoder, K: float) -> None:
 
 __all__ = [
     "Qwen3EncoderConfig", "Qwen3EncoderLayer", "Qwen3Encoder",
+    "Qwen3RMSNorm", "make_norm",
     "PplxEmbedModel", "PplxEmbedContextModel", "N_MAX_CHUNKS",
     "load_encoder_weights", "apply_fp16_residual_rescale",
 ]

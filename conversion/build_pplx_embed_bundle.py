@@ -66,6 +66,7 @@ def build_bundle(
     variant: str = "plain",
     dynamic_upper: int = 0,
     skip_if_exists: bool = True,
+    norm_impl: str = "native",
 ) -> str:
     """Build a CoreML bundle.
 
@@ -89,7 +90,8 @@ def build_bundle(
     snap = hf_repo if os.path.isdir(hf_repo) else _snapshot_dir(hf_repo)
     # RoPE table must cover the largest sequence: the bucket, or the dynamic upper bound.
     rope_len = dynamic_upper if dynamic else max_seq_len
-    cfg = Qwen3EncoderConfig.from_json(os.path.join(snap, "config.json"), max_seq_len=rope_len)
+    cfg = Qwen3EncoderConfig.from_json(os.path.join(snap, "config.json"),
+                                       max_seq_len=rope_len, norm_impl=norm_impl)
     if variant == "context":
         model = PplxEmbedContextModel(cfg, output_mode=output_mode).eval()
     else:
@@ -161,14 +163,15 @@ def build_bundle(
     print(f"  saved {pkg} ({size_mb:.1f} MB)")
 
     _write_model_config(output_dir, model_name, hf_repo, cfg, max_seq_len,
-                        output_mode, rescale_k, quantize, variant, dynamic_upper)
+                        output_mode, rescale_k, quantize, variant, dynamic_upper, norm_impl)
     _copy_tokenizer(snap, output_dir)
     print(f"[4/4] bundle ready at {output_dir}")
     return pkg
 
 
 def _write_model_config(output_dir, model_name, hf_repo, cfg, max_seq_len,
-                        output_mode, rescale_k, quantize, variant="plain", dynamic_upper=0):
+                        output_mode, rescale_k, quantize, variant="plain", dynamic_upper=0,
+                        norm_impl="native"):
     dynamic = dynamic_upper > 0
     out_dtype = "int8" if output_mode == "int8" else "fp16"
     out_shape = [N_MAX_CHUNKS, 1024] if variant == "context" else [1, 1024]
@@ -211,6 +214,7 @@ def _write_model_config(output_dir, model_name, hf_repo, cfg, max_seq_len,
         "dynamic_upper": dynamic_upper if dynamic else 0,
         "output_mode": output_mode,
         "fp16_residual_rescale_k": rescale_k,
+        "norm_impl": norm_impl,
         "pooling": "mean",
         "quantization_weights": quantize or "fp16",
         "matryoshka_dims": [1024, 512, 256, 128],
@@ -252,6 +256,10 @@ def main():
     ap.add_argument("--hf-dir", default=None, help="Override HF dir (skip download)")
     ap.add_argument("--output", default=None)
     ap.add_argument("--no-skip", action="store_true", help="Rebuild even if exists")
+    ap.add_argument("--norm-impl", default="native", choices=["ane_cat", "native"],
+                    help="RMSNorm for the 5 encoder norm sites: native (Qwen3RMSNorm rsqrt, "
+                         "default — 12-21%% faster on ANE per experiment_ane_rmsnorm.py) or "
+                         "ane_cat (shared cat/chunk LayerNorm trick).")
     args = ap.parse_args()
 
     reg = MODEL_REGISTRY[args.model]
@@ -265,7 +273,7 @@ def main():
     quantize = None if args.quantize == "none" else args.quantize
     build_bundle(hf_repo, args.model, output, args.max_seq_len, args.output_mode,
                  args.rescale_k, quantize, variant=variant, dynamic_upper=args.dynamic_upper,
-                 skip_if_exists=not args.no_skip)
+                 skip_if_exists=not args.no_skip, norm_impl=args.norm_impl)
 
 
 if __name__ == "__main__":

@@ -173,6 +173,17 @@ not a fixable implementation issue in our encoder.** Evidence:
   question (native RMSNorm vs cat/chunk on this chip/OS), orthogonal to GPU residency
   — flagged, not pursued here.
 
+  **Resolved (follow-up).** `conversion/experiment_ane_rmsnorm.py` isolated the RMSNorm
+  (changing *only* the 5 encoder norm sites, `norm_impl=native` vs `ane_cat`, holding
+  Conv2d-1×1 and layout fixed): native `rsqrt(mean(x²))·w` RMSNorm is **12.7% faster at
+  L=256 and 21.5% faster at L=512** on `CPU_AND_NE` (M4 Max / macOS 26 / coremltools 9),
+  at **identical 99.81% ANE residency** and cosine **0.99998** vs the fp32 oracle. So the
+  RMSNorm alone accounts for essentially all of the GPU-native rebuild's ANE speedup —
+  the cat([x,−x])→LayerNorm trick (chosen years ago because the ANE lacked a fast native
+  rsqrt) is now a *de-optimization* on this stack. **`norm_impl=native` is now the
+  pplx-embed encoder default.** A shared rollout to the other decoder families' shared
+  `ane_ops.ANERMSNorm` is a separate flagged follow-up (`docs/ANE_RMSNORM_FOLLOWUP.md`).
+
 ---
 
 ## Method

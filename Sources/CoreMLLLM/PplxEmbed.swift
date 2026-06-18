@@ -147,6 +147,130 @@ public final class PplxEmbed {
                          dynamicBucket: dynamic, variant: variant, computeUnits: computeUnits)
     }
 
+    /// Download selected buckets from a HuggingFace repo, then load them.
+    ///
+    /// Publishes-as-download path (companion to `conversion/upload_pplx_embed.py`):
+    /// the repo holds one subfolder per bucket plus a top-level `manifest.json`
+    /// inventory. This fetches the manifest, selects the requested fixed buckets
+    /// (+ the dynamic GPU catch-all, if present) for `variant`, and **selectively**
+    /// downloads only those subfolders' files (`encoder.<mlpackage|mlmodelc>` +
+    /// `model_config.json` + `hf_model/` tokenizer) via `Gemma3BundleDownloader` —
+    /// the others are never fetched. It is format-agnostic: whatever the manifest
+    /// lists for a bucket (a `.mlpackage` or a precompiled `.mlmodelc`) is what gets
+    /// pulled, and the existing local `load(bundleDir:)` handles either.
+    ///
+    /// - Parameters:
+    ///   - repo: HF repo id, e.g. `"<account>/pplx-embed-coreml"`.
+    ///   - buckets: fixed bucket sizes (L) to fetch, e.g. `[512, 1024, 2048]`.
+    ///     The dynamic catch-all (if the repo has one) is always included so long
+    ///     inputs still work.
+    ///   - into: cache directory; the bundle lands at `into/<repo-leaf>[/context]`.
+    ///   - variant: `"plain"` or `"context"`.
+    ///   - preferCompiled: when the repo ships both formats, download the precompiled
+    ///     `.mlmodelc` (no on-device compile) rather than the `.mlpackage`. Only the
+    ///     chosen format's ~1.1 GB weights are fetched per bucket, never both.
+    @discardableResult
+    public static func load(
+        repo: String,
+        buckets: [Int] = [512, 1024, 2048],
+        into directory: URL,
+        computeUnits: MLComputeUnits = .cpuAndNeuralEngine,
+        variant: String = "plain",
+        preferCompiled: Bool = true,
+        hfToken: String? = nil,
+        onProgress: ((Gemma3BundleDownloader.Progress) -> Void)? = nil
+    ) async throws -> PplxEmbed {
+        let manifest = try await fetchManifest(repo: repo, hfToken: hfToken)
+        let want = Set(buckets)
+
+        // Select this variant's buckets: requested fixed sizes + any dynamic catch-all.
+        var files: [String] = []
+        var hasContextSubfolder = false
+        for b in manifest.buckets where b.variant == variant {
+            let take = b.dynamic || want.contains(b.maxSeqLen)
+            guard take else { continue }
+            if b.subfolder.hasPrefix("context/") { hasContextSubfolder = true }
+            files.append(contentsOf: b.selectFiles(preferCompiled: preferCompiled))
+        }
+        guard !files.isEmpty else {
+            throw CoreMLLLMError.modelNotFound(
+                "no \(variant) buckets in \(repo) manifest match \(buckets)")
+        }
+
+        let folderName = (repo as NSString).lastPathComponent
+        let bundle = try await Gemma3BundleDownloader.download(
+            customRepo: repo,
+            bundleFiles: files,
+            optionalFiles: [],
+            folderName: folderName,
+            into: directory,
+            hfToken: hfToken,
+            onProgress: onProgress)
+
+        // Context subfolders live under `<repo>/context/`; point load there so the
+        // bucket dirs (context/L512-int8/…) are discovered as top-level entries.
+        let loadDir = (variant == "context" && hasContextSubfolder)
+            ? bundle.appendingPathComponent("context") : bundle
+        return try await load(bundleDir: loadDir, computeUnits: computeUnits)
+    }
+
+    // MARK: - Manifest
+
+    /// One bucket entry parsed from the repo's `manifest.json`.
+    private struct ManifestBucket {
+        let subfolder: String
+        let variant: String
+        let dynamic: Bool
+        let maxSeqLen: Int
+        let formats: [String]   // e.g. ["mlmodelc", "mlpackage"]
+        let files: [String]     // repo-relative paths (subfolder-prefixed)
+
+        /// Files to download for this bucket given a format preference. Returns the
+        /// shared files (model_config.json, hf_model/…) plus only the chosen format's
+        /// `encoder.<fmt>/…` files — never both formats' weights.
+        func selectFiles(preferCompiled: Bool) -> [String] {
+            let preferred = preferCompiled ? "mlmodelc" : "mlpackage"
+            let chosen = formats.contains(preferred) ? preferred
+                : (formats.first ?? preferred)
+            // Drop the non-chosen format's files; keep shared files + the chosen dir.
+            let otherDir = "\(subfolder)/encoder.\(chosen == "mlmodelc" ? "mlpackage" : "mlmodelc")/"
+            return files.filter { !$0.hasPrefix(otherDir) }
+        }
+    }
+    private struct Manifest { let buckets: [ManifestBucket] }
+
+    /// Fetch + parse `manifest.json` from a HF repo.
+    private static func fetchManifest(repo: String, hfToken: String?) async throws -> Manifest {
+        let urlStr = "https://huggingface.co/\(repo)/resolve/main/manifest.json"
+        var req = URLRequest(url: URL(string: urlStr)!)
+        if let hfToken { req.setValue("Bearer \(hfToken)", forHTTPHeaderField: "Authorization") }
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        if let http = resp as? HTTPURLResponse, http.statusCode >= 400 {
+            throw Gemma3BundleDownloader.Error.httpStatus(
+                http.statusCode, url: urlStr, body: String(data: data, encoding: .utf8) ?? "")
+        }
+        guard let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let raw = j["buckets"] as? [[String: Any]]
+        else { throw CoreMLLLMError.modelNotFound("malformed manifest.json in \(repo)") }
+
+        let buckets: [ManifestBucket] = raw.compactMap { e in
+            guard let subfolder = e["subfolder"] as? String,
+                  let fileObjs = e["files"] as? [[String: Any]] else { return nil }
+            let dynamic = (e["dynamic"] as? Bool) ?? false
+            // Fixed buckets carry an integer "bucket"; dynamic uses dynamic_upper/max_seq_len.
+            let maxSeqLen = (e["bucket"] as? Int)
+                ?? (e["dynamic_upper"] as? Int)
+                ?? (e["max_seq_len"] as? Int) ?? 0
+            let variant = (e["variant"] as? String) ?? "plain"
+            let formats = (e["formats"] as? [String]) ?? ["mlpackage"]
+            let files = fileObjs.compactMap { $0["path"] as? String }
+            return ManifestBucket(subfolder: subfolder, variant: variant,
+                                  dynamic: dynamic, maxSeqLen: maxSeqLen,
+                                  formats: formats, files: files)
+        }
+        return Manifest(buckets: buckets)
+    }
+
     /// Parse a single bucket directory's model_config.json. Only accepts
     /// int8-output buckets (the deliverable format).
     private static func parseBucket(at dir: URL) -> BucketConfig? {
