@@ -71,5 +71,7 @@ ANE. Inputs larger than the biggest bucket are routed to the flexible RangeDim m
   highest-throughput path; batching is not a useful lever on CoreML (see below).
 
 See [`PPLX_EMBED_W8A8.md`](PPLX_EMBED_W8A8.md) (weight/activation quantization is not viable for
-this model) and [`PPLX_EMBED_BATCHING.md`](PPLX_EMBED_BATCHING.md) (batching is not a useful
-throughput lever — the ANE is batch-1 by design).
+this model), [`PPLX_EMBED_BATCHING.md`](PPLX_EMBED_BATCHING.md) (batching is not a useful
+throughput lever — the ANE is batch-1 by design), and
+[`PPLX_EMBED_GPU_RESIDENCY.md`](PPLX_EMBED_GPU_RESIDENCY.md) (why the GPU `CPU_AND_GPU` path has
+low GPU residency — an inherent CoreML partitioner behavior at B=1, not a fixable issue).
