@@ -165,17 +165,19 @@ device-fallback or a measurement bug: the ANE genuinely accepts the batched grap
 runs it, but serializes the batch axis. Hypothesis #1 confirmed; the earlier "flat"
 reading was a true hardware property, not a wrong-device artifact.
 
-**Open question — the `CPU_AND_GPU` GPU residency is suspiciously low** (GPU only
-4–16%, the rest on CPU). The static MLComputePlan likely understates *realized* GPU use
-(measured GPU latency does improve with B at L=128, so the GPU is carrying the batched
-matmuls at runtime), but a 4–16% static GPU share is low enough to suggest the graph
-isn't mapping cleanly to the GPU — i.e. a **possible implementation issue** (e.g. the
-Conv2d-1×1 / reshape / pad-mask layout that is tuned for the ANE may be forcing GPU↔CPU
-hand-offs). This is **not on the critical path** — the shipping path is the ANE fixed
-buckets (99.8% ANE), and the GPU is used only as the flexible >max-bucket catch-all — but
-it is worth a follow-up: a GPU-tuned variant of the graph might both raise GPU residency
-and improve the dynamic-model latency. The batch conclusions here do not depend on it
-(the head-to-head wall-time control below is device-agnostic).
+**The `CPU_AND_GPU` GPU residency is low (4–16%) — investigated and explained, not a
+bug.** A dedicated follow-up ([`PPLX_EMBED_GPU_RESIDENCY.md`](PPLX_EMBED_GPU_RESIDENCY.md))
+ruled out the obvious suspects: it is **not** an fp32-vs-fp16 issue (coremltools lowers
+the whole graph to fp16, so there are no fp32 ops to push to CPU) and **not** an ANE-tuning
+artifact (a from-scratch GPU-native rebuild — `nn.Linear`/native-RMSNorm/`(B,S,H)` — lands
+at the same ~12% GPU). The real cause is CoreML's **static `CPU_AND_GPU` partitioner**:
+for a single-sequence (B=1) transformer it places only weight-backed matmuls (`conv`/
+`linear`, `silu`, `gather`) on the GPU and routes all elementwise / reductions / layout
+ops **and the attention `matmul`+`softmax`** to the CPU. The static plan is **accurate,
+not misleading** — `CPU_AND_GPU` is genuinely *slower* than `CPU_ONLY` at B=1 (0.70–0.83×),
+so the GPU isn't carrying hidden work. None of this is on the critical path (the shipping
+path is the ANE fixed buckets, 99.8% ANE); no graph change raises GPU residency or makes
+the GPU win at B=1.
 
 ## Sanity — batching is real (no broadcast bug)
 
