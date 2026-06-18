@@ -362,9 +362,11 @@ def main() -> int:
     print("\nNow run this to upload — resumable, parallel, xet-accelerated, realtime "
           "progress (re-run the SAME command to resume if interrupted):\n")
     print(f"  hf upload-large-folder {args.repo} {stage_dir} --repo-type=model\n")
-    print("Real unique payload ≈ 1.19 GB/bucket (RoPE tables make each bucket's weights "
-          "distinct; .mlmodelc+.mlpackage share a bucket's weight.bin). Restrict buckets by "
-          "re-running this script with e.g. --buckets L512-int8 L1024-int8.")
+    print("Weights dedupe across buckets: the encoder uses a single fixed RoPE table, so "
+          "every plain bucket (and its .mlmodelc+.mlpackage) shares ONE ~1.15 GB weight.bin; "
+          "the context variant is a second blob. HF LFS stores each unique blob once, so the "
+          "real upload is ~2 weight blobs regardless of how many buckets you ship. Restrict "
+          "buckets by re-running this script with e.g. --buckets L512-int8 L1024-int8.")
     return 0
 
 
