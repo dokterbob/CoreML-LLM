@@ -1,9 +1,9 @@
 # CoreML batching throughput — pplx-embed encoder (Apple Silicon)
 
 **Question.** Does CoreML batching (B>1) raise throughput for the pplx-embed
-bidirectional Qwen3-0.6B encoder on Apple Silicon, the way MLX gives ~8× on
-larger models? An earlier quick test (L=512, pooled_fp16, warm) showed FLAT
-docs/sec across B — ANE ~9/s, GPU ~4.7/s. Is that real, and why?
+bidirectional Qwen3-0.6B encoder on Apple Silicon? An earlier quick test (L=512,
+pooled_fp16, warm) showed FLAT docs/sec across B — ANE ~9/s, GPU ~4.7/s. Is that
+real, and why? (All numbers below are on an **Apple M4 Max**, macOS 26.5.1.)
 
 **Verdict (bottom line).** The flat result is **real, not a measurement bug**, but
 it is **device-specific**:
@@ -11,29 +11,29 @@ it is **device-specific**:
 - **ANE (`CPU_AND_NE`) does NOT batch — it gets *worse* with B.** Per-doc latency
   is flat-to-rising; throughput *drops* to ~0.68–0.71× of B=1 at L=128. The ANE is
   a batch-1-oriented fixed-function accelerator: it serializes batch rows and adds
-  per-row overhead. No 8×, ever. Confirmed.
+  per-row overhead. Confirmed.
 - **GPU (`CPU_AND_GPU`) batches, but only modestly and only when one sequence
   under-fills the GPU (small L).** At L=128 it gains up to **1.44×** (B=16); at
   L=512 a single sequence already saturates the GPU, so batching is flat (~1.0×,
-  even regressing to 0.92× at B=64). Nowhere near MLX's 8×.
+  even regressing to 0.92× at B=64).
 - **CPU/BLAS (`CPU_ONLY`) batches the most — up to ~1.6× at L=128** (B=16), ~1.1×
   at L=512. This is the Accelerate/BLAS GEMM batching control behaving as expected,
   and it is the largest batch win of the three backends — but it is off a slow
   baseline, so in *absolute* docs/sec it never beats batch-1 ANE.
 
-**So: can CoreML batch like MLX's 8×? No — partially at best (~1.4–1.6× on
-GPU/CPU at short sequences, nothing on ANE).** The reason is architectural, not a
-bug: the fast path (ANE) is the one backend that fundamentally can't batch, and the
-backends that *can* batch (GPU/CPU) are the slow paths whose batch gains are small
-and saturate by L≈512. MLX's 8× comes from a Metal-kernel GPU engine that keeps the
-GPU's ALUs busy by parallelizing across the batch; CoreML's ANE path can't do that,
-and CoreML's GPU path only helps while the GPU is under-utilized.
+**So: does CoreML batching help this encoder? Only marginally (~1.4–1.6× on
+GPU/CPU at short sequences, nothing — worse — on the ANE).** The reason is
+architectural, not a bug: the fast path (ANE) is the one backend that fundamentally
+can't batch (it serializes the batch axis), and the backends that *can* batch
+(GPU/CPU) are the slow paths whose batch gains are small and saturate by L≈512.
 
 ---
 
 ## Setup
 
-- Machine: Apple Silicon, macOS 26.5.1 (arm64). coremltools 9.0.
+- Machine: **Apple M4 Max**, macOS 26.5.1 (arm64). coremltools 9.0. (Numbers are
+  machine-specific; the *qualitative* conclusions — ANE doesn't batch, GPU saturates
+  by L≈512 — should generalize, but absolute throughput will differ on other chips.)
 - Model: `PplxEmbedModel(cfg, output_mode="pooled_fp16")`, fp16 residual rescale K=8,
   traced+converted at shape **(B, L)** per cell, `minimum_deployment_target=macOS26`,
   converted with `compute_units=ALL`, then **loaded** under each compute-unit setting
@@ -113,7 +113,7 @@ and CoreML's GPU path only helps while the GPU is under-utilized.
    B=16 cuts per-doc latency 54→38 ms (**1.44×**). At L=512 one 512-token bidirectional
    pass already fills the GPU, so batching is flat (1.0–1.08×) and even regresses at
    B=64 (0.92×, thermal/occupancy). This is hypothesis #3 resolved: batching helps on
-   GPU *only* at small L, and the effect is bounded (~1.4×), nowhere near 8×.
+   GPU *only* at small L, and the effect is bounded (~1.4×).
 
 3. **CPU/BLAS batches the most (the control did its job).** `CPU_ONLY` lowers the
    GEMMs onto Accelerate/BLAS, which amortizes per-call overhead across the batch:
@@ -128,25 +128,21 @@ and CoreML's GPU path only helps while the GPU is under-utilized.
    GPU/CPU**, it would have seen the modest 1.4–1.6× gains. The blind spot was
    "only tested L=512, only looked at docs/sec deltas that are real-but-zero there."
 
-## Why no MLX-style 8×
-
-MLX gets ~8× from batching because its Metal GPU kernels run the whole batch as one
-big-matrix workload that keeps the GPU's ALUs saturated; the per-token work is
-memory-bandwidth/occupancy bound at B=1 and batching fills the machine. On CoreML:
+## Why the batching gains are bounded
 
 - The **fast path is the ANE**, and the ANE is a fixed-function, batch-1 engine: it
   streams one (C,1,S) tile at a time and there is no batch axis to parallelize over,
   so B>1 is pure serialization — it can never give a batch speedup (it gives a small
   *slowdown*).
-- The **CoreML GPU path *can* batch-parallelize** (hypothesis #2 is therefore *false*
-  as stated — CoreML GPU is not incapable of batching), **but** for this 0.6B encoder
-  a single sequence of L≥~256 already saturates the GPU, so the headroom MLX exploits
-  is already gone by the time you batch. The gain you can still capture (small L) tops
-  out around 1.4×.
+- The **CoreML GPU path *can* batch-parallelize** (hypothesis #2 — "CoreML GPU is
+  incapable of batching" — is therefore *false*), **but** for this 0.6B encoder a single
+  sequence of L≥~256 already saturates the GPU, so there is no spare occupancy left for
+  batching to fill. The gain you can still capture (small L, where one sequence
+  under-fills the ALUs) tops out around 1.4×.
 
 Net: on this model, the throughput-optimal strategy on Apple Silicon is **batch-1 on
-the ANE** (71 docs/s at L=128, 10 docs/s at L=512), and **batching is not a lever**
-that approaches MLX's 8× — at most ~1.4–1.6× on GPU/CPU at short sequences.
+the ANE** (71 docs/s at L=128, 10 docs/s at L=512); **batching is not a useful lever** —
+at most ~1.4–1.6× on GPU/CPU at short sequences, and a net loss on the ANE.
 
 ## Device-placement audit (MLComputePlan)
 
@@ -169,11 +165,17 @@ device-fallback or a measurement bug: the ANE genuinely accepts the batched grap
 runs it, but serializes the batch axis. Hypothesis #1 confirmed; the earlier "flat"
 reading was a true hardware property, not a wrong-device artifact.
 
-The `CPU_AND_GPU` plan is interesting: MLComputePlan's *static preference* keeps most
-ops on CPU and only marks more ops GPU as B grows (4%→16% at L=128). Yet the *measured*
-GPU latency improves with B at L=128 — i.e. at runtime the GPU does carry the batched
-matmuls; the static plan understates GPU use. Either way, the GPU's realized batch gain
-caps at ~1.4×.
+**Open question — the `CPU_AND_GPU` GPU residency is suspiciously low** (GPU only
+4–16%, the rest on CPU). The static MLComputePlan likely understates *realized* GPU use
+(measured GPU latency does improve with B at L=128, so the GPU is carrying the batched
+matmuls at runtime), but a 4–16% static GPU share is low enough to suggest the graph
+isn't mapping cleanly to the GPU — i.e. a **possible implementation issue** (e.g. the
+Conv2d-1×1 / reshape / pad-mask layout that is tuned for the ANE may be forcing GPU↔CPU
+hand-offs). This is **not on the critical path** — the shipping path is the ANE fixed
+buckets (99.8% ANE), and the GPU is used only as the flexible >max-bucket catch-all — but
+it is worth a follow-up: a GPU-tuned variant of the graph might both raise GPU residency
+and improve the dynamic-model latency. The batch conclusions here do not depend on it
+(the head-to-head wall-time control below is device-agnostic).
 
 ## Sanity — batching is real (no broadcast bug)
 
