@@ -222,7 +222,8 @@ the [CoreML-LLM](https://github.com/john-rocky/CoreML-LLM) pipeline. Targets mac
 Each subfolder is a **fixed-shape sequence-length bucket** that stays resident on the
 Apple Neural Engine (flexible shapes force CPU fallback). At runtime the Swift package
 pads each input to the smallest bucket that fits; inputs longer than the largest fixed
-bucket fall through to the `dyn*-int8/` flexible GPU catch-all.
+bucket fall through to the `dyn*-int8/` flexible GPU catch-all. The encoder uses native
+RMSNorm and a single fixed RoPE table — the ANE-fastest path on M4 Max / macOS 26.
 
 ## Buckets in this repo
 
@@ -230,25 +231,28 @@ bucket fall through to the `dyn*-int8/` flexible GPU catch-all.
 |---|---|---|---|---|
 {table}
 
-Every bucket embeds the same fp16 weights (byte-identical across buckets — only the
-traced shape + RoPE length differ), so HF's content-addressed LFS stores the weight blob
-**once**; downloading a single bucket pulls ~1.1 GB.
+The encoder `weight.bin` is **byte-identical across every bucket** (a single fixed-size
+RoPE table makes the weights independent of bucket length). So HF stores the weight blob
+**once**, and the HF content-addressed cache fetches it **once by etag** on download —
+pulling several buckets costs ~1.15 GB total, not ~1.15 GB × N.
 
 ## Use it
 
-Via the [CoreML-LLM Swift package](https://github.com/john-rocky/CoreML-LLM) — selective
-download of only the buckets you request:
+Via the [CoreML-LLM Swift package](https://github.com/john-rocky/CoreML-LLM). It uses the
+HF Swift Hub client, so only the buckets you request are downloaded and the shared weight
+is fetched once into the content-addressed cache:
 
 ```swift
 import CoreMLLLM
 let embedder = try await PplxEmbed.load(
     repo: "{repo}",
-    buckets: [512, 1024, 2048],       // pulls only these subfolders + tokenizer
-    into: appSupportDir)
+    buckets: [512, 1024, 2048])       // shared HF cache; weight fetched once by etag
 let vecs = try embedder.embed(["On-device embeddings", "Bonjour le monde"])  // [[Int8]]
 ```
 
-Or download the whole local bundle directory and load it with `load(bundleDir:)`.
+Each bucket is published in both `.mlpackage` and precompiled `.mlmodelc`; pass
+`preferCompiled: false` for the portable package. Or download the bundle directory
+yourself and load it with `load(bundleDir:)`.
 
 ## I/O contract (per bucket `model_config.json`)
 
