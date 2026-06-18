@@ -187,21 +187,15 @@ public final class PplxEmbed {
         let want = Set(buckets)
 
         // Select this variant's buckets (requested sizes + any dynamic catch-all) and
-        // build fnmatch globs for each one's chosen format + config + tokenizer.
-        var globs: [String] = []
+        // collect each one's exact chosen-format file paths.
+        var matching: [String] = []
         var hasContextSubfolder = false
         for b in manifest.buckets where b.variant == variant {
             guard b.dynamic || want.contains(b.maxSeqLen) else { continue }
             if b.subfolder.hasPrefix("context/") { hasContextSubfolder = true }
-            let preferred = preferCompiled ? "mlmodelc" : "mlpackage"
-            let fmt = b.formats.contains(preferred) ? preferred : (b.formats.first ?? preferred)
-            // fnmatch flag 0 → `*` spans `/`, so these select the whole chosen-format
-            // subtree + the two shared files, excluding the other format's weights.
-            globs.append("\(b.subfolder)/encoder.\(fmt)/*")
-            globs.append("\(b.subfolder)/model_config.json")
-            globs.append("\(b.subfolder)/hf_model/*")
+            matching.append(contentsOf: b.selectFiles(preferCompiled: preferCompiled))
         }
-        guard !globs.isEmpty else {
+        guard !matching.isEmpty else {
             throw CoreMLLLMError.modelNotFound(
                 "no \(variant) buckets in \(repo) manifest match \(buckets)")
         }
@@ -211,11 +205,11 @@ public final class PplxEmbed {
         let snapshot: URL
         if let directory {
             snapshot = try await client.downloadSnapshot(
-                of: repoID, kind: .model, to: directory, matching: globs,
+                of: repoID, kind: .model, to: directory, matching: matching,
                 progressHandler: { p in onProgress?(p.fractionCompleted) })
         } else {
             snapshot = try await client.downloadSnapshot(
-                of: repoID, kind: .model, matching: globs,
+                of: repoID, kind: .model, matching: matching,
                 progressHandler: { p in onProgress?(p.fractionCompleted) })
         }
 
@@ -236,14 +230,27 @@ public final class PplxEmbed {
 
     // MARK: - Manifest
 
-    /// One bucket entry parsed from the repo's `manifest.json` (download globs are
-    /// derived from `subfolder` + `formats`, so the per-file list isn't needed here).
+    /// One bucket entry parsed from the repo's `manifest.json`.
     private struct ManifestBucket {
         let subfolder: String
         let variant: String
         let dynamic: Bool
         let maxSeqLen: Int
         let formats: [String]   // e.g. ["mlmodelc", "mlpackage"]
+        let files: [String]     // exact repo-relative paths (subfolder-prefixed)
+
+        /// Exact file paths to fetch for the chosen format: shared files
+        /// (model_config.json, hf_model/…) + only the chosen format's encoder dir. We
+        /// pass these to `downloadSnapshot(matching:)` as exact patterns rather than
+        /// wildcards — `listFiles(recursive:)` also returns *directory* entries, and a
+        /// glob like `encoder.mlmodelc/*` would match (and 404 trying to GET) the
+        /// `analytics/`/`weights/` directories.
+        func selectFiles(preferCompiled: Bool) -> [String] {
+            let preferred = preferCompiled ? "mlmodelc" : "mlpackage"
+            let chosen = formats.contains(preferred) ? preferred : (formats.first ?? preferred)
+            let otherDir = "\(subfolder)/encoder.\(chosen == "mlmodelc" ? "mlpackage" : "mlmodelc")/"
+            return files.filter { !$0.hasPrefix(otherDir) }
+        }
     }
     private struct Manifest { let buckets: [ManifestBucket] }
 
@@ -270,8 +277,11 @@ public final class PplxEmbed {
                 ?? (e["max_seq_len"] as? Int) ?? 0
             let variant = (e["variant"] as? String) ?? "plain"
             let formats = (e["formats"] as? [String]) ?? ["mlpackage"]
+            let fileObjs = (e["files"] as? [[String: Any]]) ?? []
+            let files = fileObjs.compactMap { $0["path"] as? String }
             return ManifestBucket(subfolder: subfolder, variant: variant,
-                                  dynamic: dynamic, maxSeqLen: maxSeqLen, formats: formats)
+                                  dynamic: dynamic, maxSeqLen: maxSeqLen,
+                                  formats: formats, files: files)
         }
         return Manifest(buckets: buckets)
     }

@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.1
 import PackageDescription
 
 let package = Package(
@@ -42,9 +42,12 @@ let package = Package(
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.0.0"),
         // HF's native Swift Hub client (standalone — does NOT pull swift-transformers,
         // so it's orthogonal to the 1.0.x cap above). Used by PplxEmbed.load(repo:) for
-        // content-addressed snapshot downloads: byte-identical weight.bin across buckets
-        // is fetched ONCE by etag (the HF blob cache), then reused — native download dedup.
-        .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.9.0"),
+        // content-addressed snapshot downloads: the byte-identical weight.bin across
+        // buckets is fetched ONCE (then reused) — native download dedup. The `Xet` trait
+        // is REQUIRED: HF stores large files Xet-backed by default, and without it the
+        // client forces the LFS transport and 404s on Xet-only blobs. (Needs tools 6.1+.)
+        .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.9.0",
+                 traits: ["Xet"]),
     ],
     targets: [
         .target(
