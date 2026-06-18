@@ -145,10 +145,10 @@ def _discover_buckets(plain_dir: Path | None, context_dir: Path | None,
 
 
 def _build_manifest(buckets: list[tuple[str, Path]], repo: str) -> dict:
-    # Size-only manifest (no sha256): the Swift client's `load(repo:)` only needs the
-    # per-bucket file *paths* for selective download, and the resumable uploader
-    # (`hf upload-large-folder`, xet) does its own content hashing + dedup. Hashing the
-    # full ~14 GB here just to write the manifest was a pure-CPU, zero-network stall.
+    # Size-only manifest: the Swift `load(repo:)` derives download globs from each
+    # bucket's subfolder + formats, and the HF Swift Hub client's content-addressed
+    # cache dedups the byte-identical weight.bin by etag on download — so no per-file
+    # sha is needed here (and staging stays instant, no ~14 GB hash).
     base_url = f"https://huggingface.co/{repo}/resolve/main"
     entries = []
     total = 0

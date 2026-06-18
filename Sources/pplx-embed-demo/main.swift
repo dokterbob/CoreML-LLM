@@ -66,10 +66,10 @@ let asJSON = flag("--json")   // emit raw int8 vectors as JSON (for parity check
 
 let embedder: PplxEmbed
 if !repo.isEmpty {
-    // Download-then-run: pull only the requested buckets from HF, then load.
+    // Download-then-run: pull only the requested buckets from HF (content-addressed
+    // cache → the shared weight.bin is fetched once), then load.
     let buckets = args("--buckets").compactMap { Int($0) }
-    let cacheDir = URL(fileURLWithPath: arg("--cache-dir",
-        FileManager.default.temporaryDirectory.appendingPathComponent("pplx-embed-cache").path))
+    let cacheDir = args("--cache-dir").first.map { URL(fileURLWithPath: $0) }
     let hfToken = args("--hf-token").first ?? ProcessInfo.processInfo.environment["HF_TOKEN"]
     embedder = try await PplxEmbed.load(
         repo: repo,
@@ -78,9 +78,8 @@ if !repo.isEmpty {
         computeUnits: cu,
         variant: isContext ? "context" : "plain",
         hfToken: hfToken,
-        onProgress: { p in
-            let pct = p.bytesTotal > 0 ? Int(100 * p.bytesReceived / p.bytesTotal) : 0
-            FileHandle.standardError.write("\r[download] \(pct)% \(p.currentFile)        "
+        onProgress: { frac in
+            FileHandle.standardError.write("\r[download] \(Int(frac * 100))%   "
                 .data(using: .utf8)!)
         })
     FileHandle.standardError.write("\n".data(using: .utf8)!)
